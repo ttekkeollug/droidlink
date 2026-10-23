@@ -38,14 +38,15 @@ droidlink mirror                   # 화면 미러링도 같이
 |---|---|
 | Cmd+C / V / X / A / Z | 복사 / 붙여넣기 / 잘라내기 / 전체 선택 / 실행 취소 (Cmd → Ctrl로 바꿔서 보냄) |
 | Ctrl | 안드로이드 Meta 키 (Ctrl+Tab = 최근 앱 등) |
-| 두 손가락 스크롤 | 스크롤 |
+| 두 손가락 위/아래 | 스크롤 |
+| 두 손가락 ← → 가로 밀기 | 화면 슬라이드 (홈 화면 페이지, 사진 넘기기 등) |
 | 세 손가락 → 오른쪽 스와이프 | 뒤로 |
 | 세 손가락 ← 왼쪽 스와이프 | 앞으로 |
 | 세 손가락 ↑ 위로 스와이프 | 최근 앱 |
 | 세 손가락 ↓ 아래로 스와이프 | 홈 |
 
 커서가 맥으로 돌아오면 모든 단축키와 제스처가 원래대로 맥에서 동작한다.
-제스처 감도는 `edge.swift`의 `swipeDistance`로 조절한다.
+제스처 감도는 `edge.swift`의 `swipeDistance`(세 손가락), `slideDistance`(두 손가락)로 조절한다.
 
 작은 `droidlink` 창(항상 위)이 입력을 받는 창이다. 창을 닫거나 터미널에서 `Ctrl+C`로 종료.
 
@@ -53,7 +54,7 @@ droidlink mirror                   # 화면 미러링도 같이
 
 동작 원리: `edge.swift`가 맥 커서 위치를 보고 있다가 오른쪽 끝에 닿으면 scrcpy 창을 클릭해 마우스를 잡게 하고,
 폰 커서 위치는 `adb shell dumpsys input`으로 읽어 왼쪽 끝(x=0)에 닿으면 원래 앱으로 포커스를 돌려준다.
-폰에 있는 동안 키 입력은 이벤트 탭으로 가로채 scrcpy에만 보내고, 세 손가락 제스처는 MultitouchSupport로 읽어 `input keyevent`로 바꾼다.
+폰에 있는 동안 키 입력은 이벤트 탭으로 가로채 scrcpy에만 보내고, 트랙패드 제스처는 MultitouchSupport로 읽어 `input keyevent` / `input swipe`로 바꾼다.
 
 ## 요구사항
 

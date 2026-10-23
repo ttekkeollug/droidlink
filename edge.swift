@@ -121,32 +121,68 @@ if let tap {
     print("키보드 가로채기 실패: 손쉬운 사용 권한을 확인하세요. (단축키가 맥에서도 실행됩니다)")
 }
 
-// MARK: 트랙패드 제스처 — 손가락 3개 이상 스와이프를 안드로이드 키로 바꾼다.
-// 맥과 같은 느낌: 오른쪽 = 뒤로, 왼쪽 = 앞으로, 위 = 최근 앱(Mission Control), 아래 = 홈.
-let swipeDistance = 0.12  // 트랙패드 폭 대비 이동 비율. 너무 민감/둔하면 조절
+// MARK: 트랙패드 제스처 — 폰에 있을 때 손가락 제스처를 안드로이드 동작으로 바꾼다.
+// 두 손가락 가로: 화면 슬라이드(터치 스와이프). 두 손가락 세로는 scrcpy가 스크롤로 보낸다.
+// 세 손가락 이상, 맥과 같은 느낌: 오른쪽 = 뒤로, 왼쪽 = 앞으로, 위 = 최근 앱(Mission Control), 아래 = 홈.
+let swipeDistance = 0.12  // 세 손가락: 트랙패드 폭 대비 이동 비율. 너무 민감/둔하면 조절
+let slideDistance = 0.15  // 두 손가락 가로 슬라이드 판정 거리
 signal(SIGPIPE, SIG_IGN)
-var keyShell: FileHandle?
-func androidKey(_ code: Int, _ name: String) {
-    if keyShell == nil {
+var shell: FileHandle?
+func androidShell(_ command: String, _ name: String) {
+    if shell == nil {
         let p = Process(), pipe = Pipe()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["adb", "shell"]
         p.standardInput = pipe
         p.standardOutput = FileHandle.nullDevice
         try? p.run()
-        keyShell = pipe.fileHandleForWriting
+        shell = pipe.fileHandleForWriting
     }
-    keyShell?.write(Data("input keyevent \(code)\n".utf8))
+    shell?.write(Data("\(command)\n".utf8))
     print("  제스처: \(name)")
 }
+func androidKey(_ code: Int, _ name: String) { androidShell("input keyevent \(code)", name) }
 
-var swipeStart: (x: Double, y: Double)?, swipeFired = false
+// "Physical size: 1080x2340" / "Override size: ..." 중 마지막 값 (덮어쓴 해상도가 있으면 그것)
+func parseSize(_ text: String) -> (w: Int, h: Int)? {
+    guard let last = text.split(separator: "\n").last(where: { $0.contains("size:") }),
+          let dims = last.split(separator: " ").last?.split(separator: "x"), dims.count == 2,
+          let w = Int(dims[0]), let h = Int(dims[1]) else { return nil }
+    return (w, h)
+}
+assert(parseSize("Physical size: 1080x2340\nOverride size: 720x1560")! == (720, 1560))
+
+// ponytail: 화면 크기는 시작할 때 한 번만 읽는다. 폰을 가로로 돌리면 슬라이드가 세로 기준이 됨 — 필요하면 매번 읽기.
+let screenSize: (w: Int, h: Int)? = {
+    let p = Process(), pipe = Pipe()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = ["adb", "shell", "wm", "size"]
+    p.standardOutput = pipe
+    try? p.run(); p.waitUntilExit()
+    return parseSize(String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+}()
+
+func androidSlide(toLeft: Bool) {
+    guard let (w, h) = screenSize else { return }
+    let (from, to) = toLeft ? (w * 4 / 5, w / 5) : (w / 5, w * 4 / 5)
+    androidShell("input swipe \(from) \(h / 2) \(to) \(h / 2) 150", toLeft ? "← 슬라이드" : "→ 슬라이드")
+}
+
+var gestureStart: (x: Double, y: Double, fingers: Int)?, gestureFired = false
 func handleTouches(_ n: Int, _ x: Double, _ y: Double) {
-    guard onAndroid, n >= 3 else { if n == 0 { swipeStart = nil }; return }
-    guard let s = swipeStart else { swipeStart = (x, y); swipeFired = false; return }
+    if n == 0 { gestureStart = nil; gestureFired = false; return }
+    guard onAndroid, n >= 2, !gestureFired else { return }
+    // 손가락 수가 바뀌면(2→3 등) 그 지점부터 다시 잰다
+    guard let s = gestureStart, s.fingers == n else { gestureStart = (x, y, n); return }
     let dx = x - s.x, dy = y - s.y
-    guard !swipeFired, max(abs(dx), abs(dy)) > swipeDistance else { return }
-    swipeFired = true
+    if n == 2 {
+        guard abs(dx) > slideDistance, abs(dx) > 2 * abs(dy) else { return }  // 세로 스크롤과 구분
+        gestureFired = true
+        androidSlide(toLeft: dx < 0)  // 맥 자연스러운 스크롤처럼 손가락 방향 그대로
+        return
+    }
+    guard max(abs(dx), abs(dy)) > swipeDistance else { return }
+    gestureFired = true
     if abs(dx) > abs(dy) {
         dx > 0 ? androidKey(4, "뒤로") : androidKey(125, "앞으로")
     } else {
