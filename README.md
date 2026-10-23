@@ -8,13 +8,11 @@
 
 ### 앱으로 (추천)
 
-1. 필요한 도구 설치:
-   ```bash
-   brew install scrcpy android-platform-tools
-   ```
-2. [Releases](https://github.com/ttekkeollug/droidlink/releases/latest)에서 `droidlink-macos.zip`을 받아 풀고 `droidlink.app`을 **응용 프로그램** 폴더로 옮긴다.
-3. 처음 한 번은 `droidlink.app`을 **우클릭 → 열기**. (개발자 서명이 없는 앱이라 그냥 더블클릭하면 막힌다)
-4. **시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용**에서 **droidlink**를 켠다. 화면 끝 전환·단축키·제스처에 필요하다.
+앱 안에 [scrcpy](https://github.com/Genymobile/scrcpy) 5.0.1과 adb가 들어 있어서 따로 설치할 것이 없다.
+
+1. [Releases](https://github.com/ttekkeollug/droidlink/releases/latest)에서 `droidlink-macos.zip`을 받아 풀고 `droidlink.app`을 **응용 프로그램** 폴더로 옮긴다.
+2. 처음 한 번은 `droidlink.app`을 **우클릭 → 열기**. (개발자 서명이 없는 앱이라 그냥 더블클릭하면 막힌다)
+3. **시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용**에서 **droidlink**를 켠다. 화면 끝 전환·단축키·제스처에 필요하다.
    새 버전으로 바꾸면 다시 켜야 할 수 있다.
 
 ### 터미널로
@@ -25,7 +23,10 @@ git clone https://github.com/ttekkeollug/droidlink && cd droidlink
 ln -s "$PWD/droidlink" /usr/local/bin/droidlink
 ```
 
-직접 앱으로 빌드하려면 `./build-app.sh` (universal `droidlink.app`과 `droidlink-macos.zip`이 생긴다).
+터미널 버전은 Homebrew의 scrcpy·adb를 쓴다.
+
+직접 앱으로 빌드하려면 `./build-app.sh` — scrcpy 공식 macOS 빌드를 받아(체크섬 확인) 앱에 넣고,
+universal `droidlink.app`과 `droidlink-macos.zip`을 만든다. 앱이 연결 중일 때 Dock에 보이는 **droidlink 입력**은 앱 안에 든 scrcpy다.
 
 폰: **설정 → 휴대전화 정보 → 빌드번호 7번 탭** → 개발자 옵션 → **USB 디버깅** 켜기.
 
@@ -58,10 +59,12 @@ droidlink mirror                   # 화면 미러링도 같이
 - 마지막으로 쓴 무선 주소는 기억해 두고, 다음에 **[연결]**을 누르면 케이블이 없을 때 그 주소로 연결한다.
 - **커서 속도** (-7 ~ 7): 폰의 마우스 포인터 속도 설정을 바로 바꾼다.
 - **스크롤 속도** (1 ~ 10): 두 손가락 위아래 스크롤 속도. 맥에 저장돼서 다음 실행에도 유지된다.
+- **폰 위치** (왼쪽 / 오른쪽): 폰을 맥의 어느 쪽에 둔 것처럼 쓸지. 오른쪽이면 맥 오른쪽 끝 → 폰, 폰 왼쪽 끝 → 맥.
+  왼쪽이면 맥 왼쪽 끝 → 폰, 폰 오른쪽 끝 → 맥.
 
 ### 화면 끝으로 전환 (듀얼 모니터처럼)
 
-폰이 맥 화면 **오른쪽**에 붙어 있다고 생각하면 된다.
+폰이 맥 화면 **오른쪽**에 붙어 있다고 생각하면 된다 (창의 *폰 위치*에서 왼쪽으로 바꿀 수 있다).
 
 - 맥 커서를 화면 **오른쪽 끝**으로 밀면 → 커서와 키보드가 폰으로 넘어간다.
 - 폰 커서를 화면 **왼쪽 끝**으로 밀면 → 커서와 키보드가 맥으로 돌아온다.

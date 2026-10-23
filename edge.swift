@@ -11,7 +11,18 @@ let launchSerial = ProcessInfo.processInfo.environment["ANDROID_SERIAL"].flatMap
 let env = URL(fileURLWithPath: "/usr/bin/env")
 signal(SIGPIPE, SIG_IGN)
 // Finder에서 실행한 앱은 PATH에 Homebrew가 없어서 adb/scrcpy를 못 찾는다
-setenv("PATH", "/opt/homebrew/bin:/usr/local/bin:" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"), 1)
+// droidlink.app 안에 scrcpy·adb가 들어 있으면 그것을 쓰고, 없으면(터미널용 빌드) Homebrew의 것을 쓴다.
+// scrcpy는 Contents/Helpers/droidlink-input.app 안에 넣어 Dock에 "droidlink 입력"으로 보이게 한다.
+let bundledScrcpy = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/droidlink-input.app/Contents/MacOS/scrcpy").path
+let bundledTools = Bundle.main.resourceURL.map { $0.appendingPathComponent("scrcpy").path }
+    .flatMap { FileManager.default.isExecutableFile(atPath: $0 + "/adb") ? $0 : nil }
+setenv("PATH", (bundledTools.map { $0 + ":" } ?? "") + "/opt/homebrew/bin:/usr/local/bin:" +
+       (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"), 1)
+if let bundledTools {  // 공식 scrcpy 빌드는 PATH가 아니라 이 변수들로 adb와 서버를 찾는다
+    setenv("ADB", bundledTools + "/adb", 1)
+    setenv("SCRCPY_SERVER_PATH", bundledTools + "/scrcpy-server", 1)
+}
+let scrcpyCommand = FileManager.default.isExecutableFile(atPath: bundledScrcpy) ? bundledScrcpy : "scrcpy"
 
 // MARK: 설정 — 스크롤 속도는 맥에 저장, 커서 속도는 폰의 pointer_speed 설정(-7~7)을 직접 바꾼다.
 var scrollSpeed = UserDefaults.standard.object(forKey: "scrollSpeed") as? Double ?? 4  // 1~10
@@ -30,7 +41,7 @@ func run(_ args: [String]) -> String {  // 짧은 명령을 기다렸다가 결�
     return String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
 }
 func adb(_ args: [String]) -> String { run(["adb"] + args) }
-let missingTools = ["adb", "scrcpy"].filter { run(["which", $0]).isEmpty }
+let missingTools = ["adb", scrcpyCommand].filter { $0.hasPrefix("/") ? false : run(["which", $0]).isEmpty }
 
 // 계속 열어 두는 `adb shell`. 스크롤과 제스처를 다른 채널로 보내서 서로 기다리지 않게 한다.
 var shells: [String: (process: Process, input: FileHandle)] = [:]
@@ -74,6 +85,14 @@ let ui = UI()
 
 func cursor() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
 func rightEdge() -> Double { NSScreen.screens.map { $0.frame.maxX }.max() ?? 0 }
+func leftEdge() -> Double { NSScreen.screens.map { $0.frame.minX }.min() ?? 0 }
+
+// 폰 위치: 맥의 오른쪽(기본)이면 맥 오른쪽 끝 → 폰, 폰 왼쪽 끝 → 맥. 왼쪽이면 반대.
+var phoneOnLeft = UserDefaults.standard.bool(forKey: "phoneOnLeft")
+var androidWidth: Double?  // 폰 화면의 지금 가로 폭 (가로 모드면 길어진다)
+func atMacEdge(_ x: Double) -> Bool { phoneOnLeft ? x <= leftEdge() + edgeMargin : x >= rightEdge() - edgeMargin }
+// 폰 커서가 맥으로 돌아가는 쪽 끝에서 얼마나 떨어져 있는지
+func distanceFromReturnEdge(_ x: Double, width: Double) -> Double { phoneOnLeft ? width - 1 - x : x }
 
 func scrcpyWindowCenter() -> CGPoint? {
     let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
@@ -98,12 +117,20 @@ func click(at p: CGPoint) {
 func startPoller() {
     let p = Process(), pipe = Pipe()
     p.executableURL = env
-    p.arguments = ["adb", "shell", "while :; do dumpsys input 2>/dev/null | sed -n 's/.*DeviceId(\\([0-9]*\\)).*MOUSE) at (\\([0-9.]*\\), \\([0-9.]*\\)).*/\\1 \\2 \\3/p' | sort -n | tail -n1; sleep 0.1; done"]
+    p.arguments = ["adb", "shell", """
+        while :; do d=$(dumpsys input 2>/dev/null)
+        echo "$d" | sed -n 's/.*DeviceId(\\([0-9]*\\)).*MOUSE) at (\\([0-9.]*\\), \\([0-9.]*\\)).*/\\1 \\2 \\3/p' | sort -n | tail -n1
+        echo "$d" | sed -n 's/.*Viewport INTERNAL.*logicalFrame=\\[0, 0, \\([0-9]*\\), [0-9]*\\].*/W \\1/p' | head -n1
+        sleep 0.1; done
+        """]
     p.standardOutput = pipe
     pipe.fileHandleForReading.readabilityHandler = { h in
-        let text = String(decoding: h.availableData, as: UTF8.self)
-        if let pos = text.split(separator: "\n").compactMap({ parsePos(String($0)) }).last {
-            DispatchQueue.main.async { androidPos = pos }
+        let lines = String(decoding: h.availableData, as: UTF8.self).split(separator: "\n")
+        let width = lines.last { $0.hasPrefix("W ") }.flatMap { Double($0.dropFirst(2)) }
+        let pos = lines.compactMap { parsePos(String($0)) }.last
+        DispatchQueue.main.async {
+            if let width { androidWidth = width }
+            if let pos { androidPos = pos }
         }
     }
     try? p.run()
@@ -128,11 +155,14 @@ func giveFocusBack() {
 }
 
 func leave(activatePrevious: Bool) {
-    print(activatePrevious ? "→ 맥 (폰 왼쪽 끝)" : "→ 맥 (scrcpy 포커스 잃음)")
+    print(activatePrevious ? "→ 맥" : "→ 맥 (scrcpy 포커스 잃음)")
     onAndroid = false
     poller?.terminate(); poller = nil
     if activatePrevious { giveFocusBack() }
-    CGWarpMouseCursorPosition(CGPoint(x: rightEdge() - returnInset, y: enterY))
+    let back = CGPoint(x: phoneOnLeft ? leftEdge() + returnInset : rightEdge() - returnInset, y: enterY)
+    CGWarpMouseCursorPosition(back)
+    // scrcpy 5(SDL3)는 마우스를 놓을 때 커서를 자기 창 쪽으로 옮기므로, 잠시 뒤 한 번 더 제자리에 둔다
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { if !onAndroid { CGWarpMouseCursorPosition(back) } }
 }
 
 // MARK: 기기 고르기 — USB가 꽂혀 있으면 USB, 없으면 무선(폰이 Wi-Fi로 알리는 주소 → 마지막으로 쓴 주소)
@@ -216,7 +246,7 @@ func connect(wireless: String? = nil) {
 func launchScrcpy(_ device: String) {
     serial = device
     setenv("ANDROID_SERIAL", device, 1)
-    var args = ["scrcpy", "--serial", device, "--keyboard=uhid", "--mouse=uhid", "--stay-awake", "--always-on-top",
+    var args = [scrcpyCommand, "--serial", device, "--keyboard=uhid", "--mouse=uhid", "--stay-awake", "--always-on-top",
                 "--shortcut-mod=rsuper", "--window-title=droidlink 입력"]
     if !mirror { args += ["--no-video", "--no-audio", "--window-width=240", "--window-height=80"] }
     let p = Process()
@@ -402,6 +432,9 @@ final class UI: NSObject, NSApplicationDelegate {
     let addressField = NSTextField(string: savedAddress ?? "")
     let codeField = NSTextField(string: "")
     lazy var cursorSlider = slider(-7, 7, 0, #selector(cursorChanged))
+    lazy var sideControl = NSSegmentedControl(labels: ["왼쪽", "오른쪽"], trackingMode: .selectOne,
+                                              target: self, action: #selector(sideChanged))
+    let hint = NSTextField(wrappingLabelWithString: "")
     lazy var scrollSlider = slider(1, 10, scrollSpeed, #selector(scrollChanged))
 
     func slider(_ min: Double, _ max: Double, _ value: Double, _ action: Selector) -> NSSlider {
@@ -422,7 +455,8 @@ final class UI: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         status.font = .boldSystemFont(ofSize: 13)
         status.widthAnchor.constraint(equalToConstant: 300).isActive = true
-        let hint = NSTextField(wrappingLabelWithString: "맥 화면 오른쪽 끝으로 커서를 밀면 폰으로, 폰 화면 왼쪽 끝으로 밀면 맥으로 돌아옵니다.")
+        sideControl.selectedSegment = phoneOnLeft ? 0 : 1
+        updateHint()
         hint.textColor = .secondaryLabelColor
         hint.widthAnchor.constraint(equalToConstant: 300).isActive = true
         addressField.placeholderString = "비우면 자동으로 찾기 (IP:포트)"
@@ -445,6 +479,7 @@ final class UI: NSObject, NSApplicationDelegate {
             wirelessHint,
             row("커서 속도", cursorSlider),
             row("스크롤 속도", scrollSlider),
+            row("폰 위치", sideControl),
             hint,
         ])
         stack.orientation = .vertical
@@ -457,7 +492,7 @@ final class UI: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if !missingTools.isEmpty {
-            update("\(missingTools.joined(separator: ", ")) 없음 · 터미널에서 brew install scrcpy android-platform-tools 를 실행한 뒤 다시 여세요")
+            update("\(missingTools.joined(separator: ", ")) 없음 · droidlink.app을 쓰거나, 터미널에서 brew install scrcpy android-platform-tools 를 실행한 뒤 다시 여세요")
             connectButton.isEnabled = false
             return
         }
@@ -478,6 +513,16 @@ final class UI: NSObject, NSApplicationDelegate {
         connectButton.isEnabled = !connected
         disconnectButton.isEnabled = connected
         cursorSlider.isEnabled = connected
+    }
+
+    func updateHint() {
+        let (mac, phone) = phoneOnLeft ? ("왼쪽", "오른쪽") : ("오른쪽", "왼쪽")
+        hint.stringValue = "맥 화면 \(mac) 끝으로 커서를 밀면 폰으로, 폰 화면 \(phone) 끝으로 밀면 맥으로 돌아옵니다. 막히면 Cmd+Option+Esc."
+    }
+    @objc func sideChanged() {
+        phoneOnLeft = sideControl.selectedSegment == 0
+        UserDefaults.standard.set(phoneOnLeft, forKey: "phoneOnLeft")
+        updateHint()
     }
 
     @objc func connectTapped() { connect() }
@@ -598,16 +643,17 @@ Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
         if scrcpy.isActive { giveFocusBack(); return }
         // 권한이 없으면 scrcpy 창을 클릭해 마우스를 잡게 할 수 없어 폰에서 못 돌아온다 — 넘어가지 않는다
         guard AXIsProcessTrusted() else { ui.warnPermission(); return }
-        if cursor().x >= rightEdge() - edgeMargin { enter() }
+        if atMacEdge(cursor().x) { enter() }
         return
     }
     // 다른 이유로 scrcpy 창이 포커스를 잃은 경우
     if !scrcpy.isActive && Date().timeIntervalSince(enteredAt) > 1 { leave(activatePrevious: false); return }
     guard let x = androidPos?.x else { return }
-    // 들어올 때 scrcpy 창으로 커서를 옮기며 생기는 큰 왼쪽 이동이 폰 커서를 왼쪽 끝으로 보낸다.
-    // 그 직후의 위치로 판정하면 바로 돌아오므로, 들어온 뒤 잠시 지나서 오른쪽으로 들어간 것만 인정한다.
-    if x > armX && Date().timeIntervalSince(enteredAt) > 0.6 { armed = true }
-    if armed && x <= 0.5 { leave(activatePrevious: true) }
+    let d = distanceFromReturnEdge(x, width: androidWidth ?? Double(screenSize?.w ?? 1080))
+    // 들어올 때 scrcpy 창으로 커서를 옮기며 생기는 큰 이동이 폰 커서를 돌아가는 쪽 끝으로 보낸다.
+    // 그 직후의 위치로 판정하면 바로 돌아오므로, 들어온 뒤 잠시 지나서 안쪽으로 들어간 것만 인정한다.
+    if d > armX && Date().timeIntervalSince(enteredAt) > 0.6 { armed = true }
+    if armed && d <= 1.5 { leave(activatePrevious: true) }
 }
 
 let app = NSApplication.shared
