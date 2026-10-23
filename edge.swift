@@ -7,7 +7,7 @@ let edgeMargin = 1.0      // 맥 오른쪽 끝 판정 여유(px)
 let armX = 30.0           // 안드로이드에서 이만큼 오른쪽으로 들어가야 복귀 판정 시작
 let returnInset = 40.0    // 맥으로 돌아올 때 오른쪽 끝에서 띄울 거리
 let mirror = CommandLine.arguments.contains("--mirror")
-let serial = ProcessInfo.processInfo.environment["ANDROID_SERIAL"].flatMap { $0.isEmpty ? nil : $0 }
+let launchSerial = ProcessInfo.processInfo.environment["ANDROID_SERIAL"].flatMap { $0.isEmpty ? nil : $0 }  // droidlink IP:PORT로 지정한 기기
 let env = URL(fileURLWithPath: "/usr/bin/env")
 signal(SIGPIPE, SIG_IGN)
 
@@ -129,20 +129,84 @@ func leave(activatePrevious: Bool) {
     CGWarpMouseCursorPosition(CGPoint(x: rightEdge() - returnInset, y: enterY))
 }
 
+// MARK: 기기 고르기 — USB가 꽂혀 있으면 USB, 없으면 무선(폰이 Wi-Fi로 알리는 주소 → 마지막으로 쓴 주소)
+var savedAddress: String? {
+    get { UserDefaults.standard.string(forKey: "wirelessAddress") }
+    set { UserDefaults.standard.set(newValue, forKey: "wirelessAddress") }
+}
+var serial = ""  // 지금 연결된 기기. ANDROID_SERIAL로도 넣어서 adb 명령이 모두 이 기기로 간다
+
+func devices() -> [String] {  // `adb devices`에서 사용 가능한(device 상태) 기기들
+    adb(["devices"]).split(separator: "\n").dropFirst().compactMap { line in
+        let f = line.split(separator: "\t")
+        return f.count == 2 && f[1] == "device" ? String(f[0]) : nil
+    }
+}
+func isWireless(_ s: String) -> Bool { s.contains(":") || s.contains("._tcp") }
+
+// `adb mdns services` 줄: "<이름>\t_adb-tls-pairing._tcp\t192.168.0.5:37199"
+func mdnsAddress(_ service: String, _ text: String) -> String? {
+    text.split(separator: "\n").last { $0.contains(service) }?.split(whereSeparator: \.isWhitespace).last.map(String.init)
+}
+assert(mdnsAddress("_adb-tls-pairing", "List of discovered mdns services\nadb-R3-x\t_adb-tls-pairing._tcp\t192.168.0.5:37199") == "192.168.0.5:37199")
+
+// `ip -f inet addr show wlan0` 의 "inet 192.168.0.5/24 brd ..." 에서 IP
+func parseWlanIP(_ text: String) -> String? {
+    guard let r = text.range(of: #"inet ([0-9.]+)/"#, options: .regularExpression) else { return nil }
+    return String(text[r].dropFirst(5).dropLast())
+}
+assert(parseWlanIP("    inet 192.168.45.110/24 brd 192.168.45.255 scope global wlan0") == "192.168.45.110")
+
+func adbConnect(_ address: String) -> Bool {
+    guard adb(["connect", address]).contains("connected to") else { return false }  // "already connected to"도 포함
+    savedAddress = address
+    return true
+}
+
+// wireless: nil이면 자동(USB 우선), 값이 있으면 무선만 — 빈 문자열이면 주소를 찾아서, 아니면 그 주소로
+func pickDevice(wireless: String?) -> String? {
+    if wireless == nil {
+        if let launchSerial { return !isWireless(launchSerial) || adbConnect(launchSerial) ? launchSerial : nil }
+        let list = devices()
+        if let usb = list.first(where: { !isWireless($0) }) { return usb }
+        if let any = list.first { return any }
+    }
+    let typed = wireless.flatMap { $0.isEmpty ? nil : $0 }
+    let candidates = typed.map { [$0] } ?? [mdnsAddress("_adb-tls-connect", adb(["mdns", "services"])), savedAddress].compactMap { $0 }
+    return candidates.first(where: adbConnect)
+}
+
 // MARK: 연결 / 연결 해제
-func connect() {
-    guard scrcpyProcess == nil else { return }
-    var args = ["scrcpy", "--keyboard=uhid", "--mouse=uhid", "--stay-awake", "--always-on-top",
+var connecting = false, pendingWireless: String?
+func connect(wireless: String? = nil) {
+    guard scrcpyProcess == nil, !connecting else { return }
+    connecting = true
+    ui.update(wireless == nil ? "연결 중…" : "무선 연결 중…")
+    DispatchQueue.global().async {
+        let picked = pickDevice(wireless: wireless)
+        DispatchQueue.main.async {
+            connecting = false
+            if let picked { launchScrcpy(picked) } else {
+                ui.update(wireless == nil ? "연결 실패 · USB 케이블을 꽂거나, 폰에서 무선 디버깅을 켜고 '무선 연결'을 누르세요"
+                                          : "무선 연결 실패 · 폰의 무선 디버깅이 켜져 있고 같은 Wi-Fi인지 확인하세요 (처음이면 페어링 먼저)")
+            }
+        }
+    }
+}
+
+func launchScrcpy(_ device: String) {
+    serial = device
+    setenv("ANDROID_SERIAL", device, 1)
+    var args = ["scrcpy", "--serial", device, "--keyboard=uhid", "--mouse=uhid", "--stay-awake", "--always-on-top",
                 "--shortcut-mod=rsuper", "--window-title=droidlink 입력"]
     if !mirror { args += ["--no-video", "--no-audio", "--window-width=240", "--window-height=80"] }
-    if let serial { args += ["--serial", serial] }
     let p = Process()
     p.executableURL = env
     p.arguments = args
     p.terminationHandler = { _ in DispatchQueue.main.async { disconnected() } }
     guard (try? p.run()) != nil else { ui.update("scrcpy를 실행할 수 없습니다"); return }
     scrcpyProcess = p; pid = p.processIdentifier
-    ui.update("연결 중…")
+    ui.update("연결 중… (\(isWireless(device) ? "Wi-Fi" : "USB"))")
     DispatchQueue.global().async {
         let name = adb(["shell", "getprop", "ro.product.model"])
         let size = parseSize(adb(["shell", "wm", "size"]))
@@ -152,6 +216,11 @@ func connect() {
             if let speed { ui.cursorSlider.doubleValue = speed }
         }
     }
+}
+
+// 이미 연결돼 있으면 끊고 나서 무선으로 다시 연결
+func reconnectWireless(_ address: String) {
+    if scrcpyProcess != nil { pendingWireless = address; disconnect() } else { connect(wireless: address) }
 }
 
 // 이 앱이 띄운 scrcpy는 SIGTERM/SIGINT를 무시해서, 맥 앱 종료 요청으로 끄고 안 되면 강제 종료한다.
@@ -169,7 +238,8 @@ func disconnected() {
     let wasConnected = scrcpy != nil
     scrcpyProcess = nil; scrcpy = nil; pid = 0
     shells.values.forEach { $0.process.terminate() }; shells = [:]
-    ui.update(wasConnected ? "연결 안 됨" : "연결 실패 · 폰이 연결돼 있고 USB 디버깅이 켜져 있는지 확인하세요")
+    ui.update(wasConnected ? "연결 안 됨" : "연결 실패 · 폰에서 USB/무선 디버깅 허용을 확인하세요")
+    if let next = pendingWireless { pendingWireless = nil; connect(wireless: next) }
 }
 
 // MARK: 스크롤 — scrcpy 2.7의 가상 휠은 트랙패드 스크롤을 제대로 못 옮긴다
@@ -282,13 +352,18 @@ func startMultitouch() {
     }
 }
 
-// MARK: 창 — 연결/연결 해제, 커서 속도, 스크롤 속도
+// MARK: 창 — 연결/연결 해제, 무선 연결, 커서 속도, 스크롤 속도
 final class UI: NSObject, NSApplicationDelegate {
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 10),
                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
     let status = NSTextField(wrappingLabelWithString: "연결 안 됨")
     lazy var connectButton = NSButton(title: "연결", target: self, action: #selector(connectTapped))
     lazy var disconnectButton = NSButton(title: "연결 해제", target: self, action: #selector(disconnectTapped))
+    lazy var pairButton = NSButton(title: "페어링", target: self, action: #selector(pairTapped))
+    lazy var wirelessButton = NSButton(title: "무선 연결", target: self, action: #selector(wirelessTapped))
+    lazy var usbToWirelessButton = NSButton(title: "USB로 무선 준비", target: self, action: #selector(usbToWirelessTapped))
+    let addressField = NSTextField(string: savedAddress ?? "")
+    let codeField = NSTextField(string: "")
     lazy var cursorSlider = slider(-7, 7, 0, #selector(cursorChanged))
     lazy var scrollSlider = slider(1, 10, scrollSpeed, #selector(scrollChanged))
 
@@ -313,9 +388,22 @@ final class UI: NSObject, NSApplicationDelegate {
         let hint = NSTextField(wrappingLabelWithString: "맥 화면 오른쪽 끝으로 커서를 밀면 폰으로, 폰 화면 왼쪽 끝으로 밀면 맥으로 돌아옵니다.")
         hint.textColor = .secondaryLabelColor
         hint.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        addressField.placeholderString = "비우면 자동으로 찾기 (IP:포트)"
+        codeField.placeholderString = "6자리 (처음 한 번)"
+        for f in [addressField, codeField] { f.widthAnchor.constraint(equalToConstant: 200).isActive = true }
+        let wirelessHint = NSTextField(wrappingLabelWithString:
+            "무선: 폰 개발자 옵션 → 무선 디버깅 켜기 → '페어링 코드로 기기 페어링'의 코드를 넣고 [페어링] → [무선 연결]. " +
+            "또는 USB로 꽂은 채 [USB로 무선 준비]를 누르면 케이블을 뽑아도 됩니다 (폰을 재부팅하면 다시 필요).")
+        wirelessHint.textColor = .secondaryLabelColor
+        wirelessHint.font = .systemFont(ofSize: 11)
+        wirelessHint.widthAnchor.constraint(equalToConstant: 300).isActive = true
         let stack = NSStackView(views: [
             status,
             NSStackView(views: [connectButton, disconnectButton]),
+            row("무선 주소", addressField),
+            row("페어링 코드", codeField),
+            NSStackView(views: [pairButton, wirelessButton, usbToWirelessButton]),
+            wirelessHint,
             row("커서 속도", cursorSlider),
             row("스크롤 속도", scrollSlider),
             hint,
@@ -342,6 +430,49 @@ final class UI: NSObject, NSApplicationDelegate {
     }
 
     @objc func connectTapped() { connect() }
+    @objc func wirelessTapped() { reconnectWireless(addressField.stringValue.trimmingCharacters(in: .whitespaces)) }
+
+    // 안드로이드 11+ 무선 디버깅 페어링. 주소는 폰이 Wi-Fi로 알리는 페어링 주소를 자동으로 찾고, 못 찾으면 입력한 주소를 쓴다.
+    @objc func pairTapped() {
+        let code = codeField.stringValue.trimmingCharacters(in: .whitespaces)
+        let typed = addressField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !code.isEmpty else { status.stringValue = "폰에 표시된 페어링 코드를 입력하세요"; return }
+        status.stringValue = "페어링 중…"
+        DispatchQueue.global().async {
+            let address = mdnsAddress("_adb-tls-pairing", adb(["mdns", "services"])) ?? (typed.isEmpty ? nil : typed)
+            let out = address.map { adb(["pair", $0, code]) } ?? ""
+            DispatchQueue.main.async {
+                if out.contains("Successfully paired") {
+                    self.codeField.stringValue = ""
+                    if typed == address { self.addressField.stringValue = "" }  // 페어링 포트는 연결 포트와 다르다
+                    self.status.stringValue = "페어링 완료 · [무선 연결]을 누르세요"
+                } else if address == nil {
+                    self.status.stringValue = "폰의 페어링 화면을 못 찾았습니다 · 폰에서 '페어링 코드로 기기 페어링'을 열어 두거나, 그 화면의 IP:포트를 무선 주소에 넣으세요"
+                } else {
+                    self.status.stringValue = "페어링 실패 · 코드를 확인하세요"
+                }
+            }
+        }
+    }
+
+    // USB로 꽂혀 있을 때 폰을 Wi-Fi 디버깅(포트 5555)으로 바꾸고 그 주소로 다시 연결한다.
+    @objc func usbToWirelessTapped() {
+        status.stringValue = "USB로 무선 준비 중…"
+        DispatchQueue.global().async {
+            guard let usb = devices().first(where: { !isWireless($0) }) else {
+                DispatchQueue.main.async { self.status.stringValue = "USB 케이블로 폰을 먼저 연결하세요" }; return
+            }
+            guard let ip = parseWlanIP(adb(["-s", usb, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"])) else {
+                DispatchQueue.main.async { self.status.stringValue = "폰이 Wi-Fi에 연결돼 있지 않습니다" }; return
+            }
+            _ = adb(["-s", usb, "tcpip", "5555"])
+            sleep(2)  // 폰의 adb가 다시 시작될 때까지
+            DispatchQueue.main.async {
+                self.addressField.stringValue = "\(ip):5555"
+                reconnectWireless("\(ip):5555")
+            }
+        }
+    }
     @objc func disconnectTapped() { disconnect() }
     @objc func cursorChanged() {
         let speed = Int(cursorSlider.doubleValue.rounded())
@@ -392,7 +523,7 @@ Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
     // scrcpy 창이 뜨면 연결 완료
     if scrcpy == nil, pid != 0, scrcpyWindowCenter() != nil {
         scrcpy = NSRunningApplication(processIdentifier: pid)
-        ui.update("연결됨 · \(deviceName.isEmpty ? "안드로이드" : deviceName)")
+        ui.update("연결됨 · \(deviceName.isEmpty ? "안드로이드" : deviceName) · \(isWireless(serial) ? "Wi-Fi" : "USB")")
     }
     guard let scrcpy else { return }
     if !onAndroid {
