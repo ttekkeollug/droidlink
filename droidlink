@@ -12,7 +12,7 @@ usage() {
   droidlink mirror [IP:PORT]    화면 미러링까지 같이 켜기
 
 맥 화면 오른쪽 끝으로 커서를 밀면 키보드·마우스가 폰으로 넘어가고,
-폰 화면 왼쪽 끝으로 밀면 맥으로 돌아온다. (왼쪽 Cmd/Option으로도 빠져나올 수 있다)
+폰 화면 왼쪽 끝으로 밀면 맥으로 돌아온다. 키보드 단축키와 트랙패드 제스처도 커서가 있는 쪽에서 동작한다.
 EOF
 }
 
@@ -40,7 +40,7 @@ dir=$(dirname "$(readlink -f "$0")")
 [ "$dir/edge" -nt "$dir/edge.swift" ] || swiftc -suppress-warnings "$dir/edge.swift" -o "$dir/edge"
 
 scrcpy "${serial[@]+"${serial[@]}"}" "${video[@]+"${video[@]}"}" \
-  --keyboard=uhid --mouse=uhid --stay-awake --window-title=droidlink --always-on-top &
+  --keyboard=uhid --mouse=uhid --stay-awake --window-title=droidlink --always-on-top --shortcut-mod=rsuper &
 pid=$!
 trap 'kill $pid 2>/dev/null' EXIT
 sleep 2  # scrcpy 창이 뜰 때까지
