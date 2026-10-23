@@ -11,7 +11,8 @@ usage() {
   droidlink pair IP:PORT CODE   무선 디버깅 페어링 (안드로이드 11+, 최초 1회)
   droidlink mirror [IP:PORT]    화면 미러링까지 같이 켜기
 
-입력 창에서 왼쪽 Cmd 또는 Option 키를 누르면 마우스 캡처가 풀리거나 다시 잡힌다.
+맥 화면 오른쪽 끝으로 커서를 밀면 키보드·마우스가 폰으로 넘어가고,
+폰 화면 왼쪽 끝으로 밀면 맥으로 돌아온다. (왼쪽 Cmd/Option으로도 빠져나올 수 있다)
 EOF
 }
 
@@ -21,7 +22,7 @@ for bin in adb scrcpy; do
   command -v "$bin" >/dev/null || { echo "'$bin'이 없습니다: brew install scrcpy android-platform-tools" >&2; exit 1; }
 done
 
-video=(--no-video --no-audio)
+video=(--no-video --no-audio --window-width=240 --window-height=80)
 case "${1:-}" in
   pair)
     [ $# -eq 3 ] || { usage >&2; exit 1; }
@@ -35,5 +36,13 @@ if [ -n "${1:-}" ]; then
   serial=(--serial "$1")
 fi
 
-exec scrcpy "${serial[@]+"${serial[@]}"}" "${video[@]+"${video[@]}"}" \
-  --keyboard=uhid --mouse=uhid --stay-awake --window-title=droidlink
+dir=$(dirname "$(readlink -f "$0")")
+[ "$dir/edge" -nt "$dir/edge.swift" ] || swiftc -suppress-warnings "$dir/edge.swift" -o "$dir/edge"
+
+scrcpy "${serial[@]+"${serial[@]}"}" "${video[@]+"${video[@]}"}" \
+  --keyboard=uhid --mouse=uhid --stay-awake --window-title=droidlink --always-on-top &
+pid=$!
+trap 'kill $pid 2>/dev/null' EXIT
+sleep 2  # scrcpy 창이 뜰 때까지
+[ -z "${1:-}" ] || export ANDROID_SERIAL="$1"
+"$dir/edge" "$pid"
