@@ -6,9 +6,12 @@ let edgeMargin = 1.0      // 맥 오른쪽 끝 판정 여유(px)
 let armX = 30.0           // 안드로이드에서 이만큼 오른쪽으로 들어가야 복귀 판정 시작
 let returnInset = 40.0    // 맥으로 돌아올 때 오른쪽 끝에서 띄울 거리
 
-// 폴러 출력 한 줄: "<deviceId> <x>"
-func parseX(_ line: String) -> Double? { line.split(separator: " ").last.flatMap { Double($0) } }
-assert(parseX("16 257.995") == 257.995)
+// 폴러 출력 한 줄: "<deviceId> <x> <y>"
+func parsePos(_ line: String) -> (x: Double, y: Double)? {
+    let f = line.split(separator: " ").compactMap { Double($0) }
+    return f.count == 3 ? (f[1], f[2]) : nil
+}
+assert(parsePos("16 257.995 2308.08")! == (257.995, 2308.08))
 
 // guard let은 최상위 코드의 지역값이 되어 C 콜백에서 못 쓰므로 전역 상수로 둔다.
 let pid = CommandLine.arguments.count == 2 ? pid_t(CommandLine.arguments[1]) ?? 0 : 0
@@ -19,7 +22,7 @@ if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedVal
     print("손쉬운 사용 권한이 필요합니다: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 이 터미널을 켜고 다시 실행하세요.")
 }
 
-var onAndroid = false, armed = false, androidX: Double?
+var onAndroid = false, armed = false, androidPos: (x: Double, y: Double)?
 var previousApp: NSRunningApplication?, enterY = 0.0, poller: Process?, enteredAt = Date()
 
 func cursor() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
@@ -47,12 +50,12 @@ func click(at p: CGPoint) {
 func startPoller() {
     let p = Process(), pipe = Pipe()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = ["adb", "shell", "while :; do dumpsys input 2>/dev/null | sed -n 's/.*DeviceId(\\([0-9]*\\)).*MOUSE) at (\\([0-9.]*\\).*/\\1 \\2/p' | sort -n | tail -n1; sleep 0.1; done"]
+    p.arguments = ["adb", "shell", "while :; do dumpsys input 2>/dev/null | sed -n 's/.*DeviceId(\\([0-9]*\\)).*MOUSE) at (\\([0-9.]*\\), \\([0-9.]*\\)).*/\\1 \\2 \\3/p' | sort -n | tail -n1; sleep 0.1; done"]
     p.standardOutput = pipe
     pipe.fileHandleForReading.readabilityHandler = { h in
         let text = String(decoding: h.availableData, as: UTF8.self)
-        if let x = text.split(separator: "\n").compactMap({ parseX(String($0)) }).last {
-            DispatchQueue.main.async { androidX = x }
+        if let pos = text.split(separator: "\n").compactMap({ parsePos(String($0)) }).last {
+            DispatchQueue.main.async { androidPos = pos }
         }
     }
     try? p.run()
@@ -63,7 +66,7 @@ func enter() {
     guard let center = scrcpyWindowCenter() else { return }
     if let front = NSWorkspace.shared.frontmostApplication, front != scrcpy { previousApp = front }
     enterY = cursor().y
-    onAndroid = true; armed = false; androidX = nil; enteredAt = Date()
+    onAndroid = true; armed = false; androidPos = nil; enteredAt = Date(); scrollAcc = 0
     scrcpy.activate()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { click(at: center) }  // 클릭하면 scrcpy가 마우스를 잡는다
     startPoller()
@@ -95,10 +98,16 @@ func swapCmdCtrl(_ raw: UInt64) -> UInt64 {
 }
 assert(swapCmdCtrl(0x100008) == 0x40001)
 
+// MARK: 스크롤 — scrcpy 2.7의 가상 휠은 트랙패드 스크롤을 제대로 못 옮긴다
+// (작은 스크롤은 0칸, 스크롤 이벤트 하나가 휠 20칸이 되기도 함). 그래서 맥 스크롤 이벤트는 버리고
+// 이동량을 모아 30ms마다 폰의 `input mouse scroll`(소수 단위 가능, 약 20ms)로 커서 위치에 보낸다.
+let scrollPointsPerStep = 50.0  // 안드로이드 휠 한 칸에 해당하는 맥 스크롤 거리(pt). 작을수록 빨리 스크롤
+var scrollAcc = 0.0
+
 // 회전·제스처 시작/끝·제스처·확대(독 스와이프)·스와이프: 폰에 있을 때는 맥이 반응하지 않게 버린다.
 let gestureTypes: [UInt32] = [18, 19, 20, 29, 30, 31]
 var tap: CFMachPort?
-let tapMask = ([CGEventType.keyDown, .keyUp, .flagsChanged].map { $0.rawValue } + gestureTypes)
+let tapMask = ([CGEventType.keyDown, .keyUp, .flagsChanged, .scrollWheel].map { $0.rawValue } + gestureTypes)
     .reduce(CGEventMask(0)) { $0 | (1 << CGEventMask($1)) }
 func handleTap(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -107,6 +116,10 @@ func handleTap(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
     }
     guard onAndroid else { return Unmanaged.passUnretained(event) }
     if gestureTypes.contains(type.rawValue) { return nil }
+    if type == .scrollWheel {  // 세로만. 가로는 두 손가락 슬라이드가 맡는다
+        scrollAcc += event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1) / scrollPointsPerStep
+        return nil
+    }
     guard let e = event.copy() else { return nil }
     e.flags = CGEventFlags(rawValue: swapCmdCtrl(event.flags.rawValue))
     if let k = swapKeycodes[e.getIntegerValueField(.keyboardEventKeycode)] { e.setIntegerValueField(.keyboardEventKeycode, value: k) }
@@ -128,7 +141,7 @@ let swipeDistance = 0.12  // 세 손가락: 트랙패드 폭 대비 이동 비�
 let slideDistance = 0.15  // 두 손가락 가로 슬라이드 판정 거리
 signal(SIGPIPE, SIG_IGN)
 var shell: FileHandle?
-func androidShell(_ command: String, _ name: String) {
+func androidShell(_ command: String, _ name: String? = nil) {
     if shell == nil {
         let p = Process(), pipe = Pipe()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -139,7 +152,7 @@ func androidShell(_ command: String, _ name: String) {
         shell = pipe.fileHandleForWriting
     }
     shell?.write(Data("\(command)\n".utf8))
-    print("  제스처: \(name)")
+    if let name { print("  제스처: \(name)") }
 }
 func androidKey(_ code: Int, _ name: String) { androidShell("input keyevent \(code)", name) }
 
@@ -220,6 +233,12 @@ func onTouchFrame(_ touches: UnsafeMutableRawPointer?, _ n: Int32) -> Int32 {
             return 0
 }
 
+Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { _ in
+    guard onAndroid, abs(scrollAcc) >= 0.05, let pos = androidPos else { return }
+    androidShell(String(format: "input mouse scroll %.0f %.0f --axis VSCROLL,%.3f", pos.x, pos.y, scrollAcc))
+    scrollAcc = 0
+}
+
 Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
     if scrcpy.isTerminated { poller?.terminate(); exit(0) }
     if !onAndroid {
@@ -228,7 +247,7 @@ Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
     }
     // 다른 이유로 scrcpy 창이 포커스를 잃은 경우
     if !scrcpy.isActive && Date().timeIntervalSince(enteredAt) > 1 { leave(activatePrevious: false); return }
-    guard let x = androidX else { return }
+    guard let x = androidPos?.x else { return }
     if x > armX { armed = true }
     if armed && x <= 0.5 { leave(activatePrevious: true) }
 }

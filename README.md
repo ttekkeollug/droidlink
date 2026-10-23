@@ -46,7 +46,7 @@ droidlink mirror                   # 화면 미러링도 같이
 | 세 손가락 ↓ 아래로 스와이프 | 홈 |
 
 커서가 맥으로 돌아오면 모든 단축키와 제스처가 원래대로 맥에서 동작한다.
-제스처 감도는 `edge.swift`의 `swipeDistance`(세 손가락), `slideDistance`(두 손가락)로 조절한다.
+제스처 감도는 `edge.swift`의 `swipeDistance`(세 손가락), `slideDistance`(두 손가락), 스크롤 속도는 `scrollPointsPerStep`(작을수록 빠름)으로 조절한다.
 
 작은 `droidlink` 창(항상 위)이 입력을 받는 창이다. 창을 닫거나 터미널에서 `Ctrl+C`로 종료.
 
@@ -55,6 +55,7 @@ droidlink mirror                   # 화면 미러링도 같이
 동작 원리: `edge.swift`가 맥 커서 위치를 보고 있다가 오른쪽 끝에 닿으면 scrcpy 창을 클릭해 마우스를 잡게 하고,
 폰 커서 위치는 `adb shell dumpsys input`으로 읽어 왼쪽 끝(x=0)에 닿으면 원래 앱으로 포커스를 돌려준다.
 폰에 있는 동안 키 입력은 이벤트 탭으로 가로채 scrcpy에만 보내고, 트랙패드 제스처는 MultitouchSupport로 읽어 `input keyevent` / `input swipe`로 바꾼다.
+세로 스크롤은 scrcpy 가상 휠 대신 맥 스크롤량을 모아 `input mouse scroll`로 커서 위치에 보낸다 (scrcpy 2.7 휠은 트랙패드의 작은 스크롤을 잃어버림).
 
 ## 요구사항
 
