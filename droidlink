@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# droidlink: 맥북 키보드/트랙패드를 안드로이드의 실제 HID 키보드·마우스로 연결한다.
+# scrcpy의 UHID 모드를 화면 미러링 없이 사용 (입력 전용 창만 뜸).
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+사용법:
+  droidlink                     USB로 연결된 폰에 연결
+  droidlink IP:PORT             무선 디버깅으로 연결 (예: 192.168.0.12:37123)
+  droidlink pair IP:PORT CODE   무선 디버깅 페어링 (안드로이드 11+, 최초 1회)
+  droidlink mirror [IP:PORT]    화면 미러링까지 같이 켜기
+
+입력 창에서 왼쪽 Cmd 또는 Option 키를 누르면 마우스 캡처가 풀리거나 다시 잡힌다.
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+for bin in adb scrcpy; do
+  command -v "$bin" >/dev/null || { echo "'$bin'이 없습니다: brew install scrcpy android-platform-tools" >&2; exit 1; }
+done
+
+video=(--no-video --no-audio)
+case "${1:-}" in
+  pair)
+    [ $# -eq 3 ] || { usage >&2; exit 1; }
+    exec adb pair "$2" "$3" ;;
+  mirror) video=(); shift ;;
+esac
+
+serial=()
+if [ -n "${1:-}" ]; then
+  adb connect "$1"
+  serial=(--serial "$1")
+fi
+
+exec scrcpy "${serial[@]+"${serial[@]}"}" "${video[@]+"${video[@]}"}" \
+  --keyboard=uhid --mouse=uhid --stay-awake --window-title=droidlink
