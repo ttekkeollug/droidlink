@@ -8,7 +8,7 @@
 
 ```bash
 brew install scrcpy android-platform-tools
-git clone https://github.com/<you>/droidlink && cd droidlink
+git clone https://github.com/ttekkeollug/droidlink && cd droidlink
 ln -s "$PWD/droidlink" /usr/local/bin/droidlink
 ```
 
