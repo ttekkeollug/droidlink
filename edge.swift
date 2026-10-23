@@ -1,10 +1,58 @@
-// edge: 맥 화면 오른쪽 끝 ↔ 안드로이드 화면 왼쪽 끝으로 커서·키보드를 넘긴다.
-// 사용: edge <scrcpy pid>   (ANDROID_SERIAL로 기기 지정 가능)
+// edge: droidlink 본체. scrcpy를 띄우고 끄는 창(연결/연결 해제, 커서·스크롤 속도)을 보여 주고,
+// 맥 화면 오른쪽 끝 ↔ 안드로이드 화면 왼쪽 끝으로 커서·키보드·트랙패드를 넘긴다.
+// 사용: edge [--mirror]   (ANDROID_SERIAL로 기기 지정 가능)
 import AppKit
 
 let edgeMargin = 1.0      // 맥 오른쪽 끝 판정 여유(px)
 let armX = 30.0           // 안드로이드에서 이만큼 오른쪽으로 들어가야 복귀 판정 시작
 let returnInset = 40.0    // 맥으로 돌아올 때 오른쪽 끝에서 띄울 거리
+let mirror = CommandLine.arguments.contains("--mirror")
+let serial = ProcessInfo.processInfo.environment["ANDROID_SERIAL"].flatMap { $0.isEmpty ? nil : $0 }
+let env = URL(fileURLWithPath: "/usr/bin/env")
+signal(SIGPIPE, SIG_IGN)
+
+// MARK: 설정 — 스크롤 속도는 맥에 저장, 커서 속도는 폰의 pointer_speed 설정(-7~7)을 직접 바꾼다.
+var scrollSpeed = UserDefaults.standard.object(forKey: "scrollSpeed") as? Double ?? 4  // 1~10
+var scrollPointsPerStep: Double { 200 / scrollSpeed }  // 안드로이드 휠 한 칸에 해당하는 맥 스크롤 거리(pt)
+
+// MARK: adb
+func adb(_ args: [String]) -> String {  // 짧은 명령을 기다렸다가 결과를 받는다
+    let p = Process(), pipe = Pipe()
+    p.executableURL = env
+    p.arguments = ["adb"] + args
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return "" }
+    let out = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+// 계속 열어 두는 `adb shell`. 스크롤과 제스처를 다른 채널로 보내서 서로 기다리지 않게 한다.
+var shells: [String: (process: Process, input: FileHandle)] = [:]
+func androidShell(_ command: String, channel: String = "gesture", _ name: String? = nil) {
+    if shells[channel] == nil {
+        let p = Process(), pipe = Pipe()
+        p.executableURL = env
+        p.arguments = ["adb", "shell"]
+        p.standardInput = pipe
+        p.standardOutput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return }
+        shells[channel] = (p, pipe.fileHandleForWriting)
+    }
+    shells[channel]?.input.write(Data("\(command)\n".utf8))
+    if let name { print("  제스처: \(name)") }
+}
+func androidKey(_ code: Int, _ name: String) { androidShell("input keyevent \(code)", name) }
+
+// "Physical size: 1080x2340" / "Override size: ..." 중 마지막 값 (덮어쓴 해상도가 있으면 그것)
+func parseSize(_ text: String) -> (w: Int, h: Int)? {
+    guard let last = text.split(separator: "\n").last(where: { $0.contains("size:") }),
+          let dims = last.split(separator: " ").last?.split(separator: "x"), dims.count == 2,
+          let w = Int(dims[0]), let h = Int(dims[1]) else { return nil }
+    return (w, h)
+}
+assert(parseSize("Physical size: 1080x2340\nOverride size: 720x1560")! == (720, 1560))
 
 // 폴러 출력 한 줄: "<deviceId> <x> <y>"
 func parsePos(_ line: String) -> (x: Double, y: Double)? {
@@ -13,17 +61,12 @@ func parsePos(_ line: String) -> (x: Double, y: Double)? {
 }
 assert(parsePos("16 257.995 2308.08")! == (257.995, 2308.08))
 
-// guard let은 최상위 코드의 지역값이 되어 C 콜백에서 못 쓰므로 전역 상수로 둔다.
-let pid = CommandLine.arguments.count == 2 ? pid_t(CommandLine.arguments[1]) ?? 0 : 0
-let scrcpy: NSRunningApplication! = NSRunningApplication(processIdentifier: pid)
-if scrcpy == nil { print("사용법: edge <scrcpy pid>"); exit(1) }
-
-if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
-    print("손쉬운 사용 권한이 필요합니다: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 이 터미널을 켜고 다시 실행하세요.")
-}
-
+// MARK: 연결 상태 (C 콜백에서도 읽으므로 전역 변수)
+var scrcpyProcess: Process?, scrcpy: NSRunningApplication?, pid: pid_t = 0
+var deviceName = "", screenSize: (w: Int, h: Int)?  // ponytail: 화면 크기는 연결할 때 한 번만 읽는다. 폰을 돌리면 슬라이드 위치가 어긋남
 var onAndroid = false, armed = false, androidPos: (x: Double, y: Double)?
 var previousApp: NSRunningApplication?, enterY = 0.0, poller: Process?, enteredAt = Date()
+let ui = UI()
 
 func cursor() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
 func rightEdge() -> Double { NSScreen.screens.map { $0.frame.maxX }.max() ?? 0 }
@@ -45,11 +88,12 @@ func click(at p: CGPoint) {
     CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
 }
 
+// 폰 커서 위치는 dumpsys input의 hover 상태에서 읽는다.
 // scrcpy를 재시작하면 이전 가상 마우스 기록이 남으므로 가장 최근(가장 큰 DeviceId) 것을 쓴다.
 // ponytail: dumpsys를 0.1초마다 폴링. 폰 CPU가 아깝다면 안드로이드 쪽 접근성 서비스로 교체.
 func startPoller() {
     let p = Process(), pipe = Pipe()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.executableURL = env
     p.arguments = ["adb", "shell", "while :; do dumpsys input 2>/dev/null | sed -n 's/.*DeviceId(\\([0-9]*\\)).*MOUSE) at (\\([0-9.]*\\), \\([0-9.]*\\)).*/\\1 \\2 \\3/p' | sort -n | tail -n1; sleep 0.1; done"]
     p.standardOutput = pipe
     pipe.fileHandleForReading.readabilityHandler = { h in
@@ -63,7 +107,7 @@ func startPoller() {
 }
 
 func enter() {
-    guard let center = scrcpyWindowCenter() else { return }
+    guard let scrcpy, let center = scrcpyWindowCenter() else { return }
     if let front = NSWorkspace.shared.frontmostApplication, front != scrcpy { previousApp = front }
     enterY = cursor().y
     onAndroid = true; armed = false; androidPos = nil; enteredAt = Date(); scrollAcc = 0
@@ -77,11 +121,61 @@ func leave(activatePrevious: Bool) {
     print(activatePrevious ? "→ 맥 (폰 왼쪽 끝)" : "→ 맥 (scrcpy 포커스 잃음)")
     onAndroid = false
     poller?.terminate(); poller = nil
-    if activatePrevious {
-        (previousApp ?? NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first)?.activate()
-    }  // 포커스를 잃으면 scrcpy가 마우스를 놓는다
+    if activatePrevious {  // 포커스를 잃으면 scrcpy가 마우스를 놓는다
+        // macOS는 활성 앱만 다른 앱에 포커스를 넘길 수 있어서, 먼저 이 앱을 활성화한 뒤 이전 앱으로 넘긴다
+        NSApp.activate(ignoringOtherApps: true)
+        if let previousApp, previousApp != NSRunningApplication.current { previousApp.activate() }
+    }
     CGWarpMouseCursorPosition(CGPoint(x: rightEdge() - returnInset, y: enterY))
 }
+
+// MARK: 연결 / 연결 해제
+func connect() {
+    guard scrcpyProcess == nil else { return }
+    var args = ["scrcpy", "--keyboard=uhid", "--mouse=uhid", "--stay-awake", "--always-on-top",
+                "--shortcut-mod=rsuper", "--window-title=droidlink 입력"]
+    if !mirror { args += ["--no-video", "--no-audio", "--window-width=240", "--window-height=80"] }
+    if let serial { args += ["--serial", serial] }
+    let p = Process()
+    p.executableURL = env
+    p.arguments = args
+    p.terminationHandler = { _ in DispatchQueue.main.async { disconnected() } }
+    guard (try? p.run()) != nil else { ui.update("scrcpy를 실행할 수 없습니다"); return }
+    scrcpyProcess = p; pid = p.processIdentifier
+    ui.update("연결 중…")
+    DispatchQueue.global().async {
+        let name = adb(["shell", "getprop", "ro.product.model"])
+        let size = parseSize(adb(["shell", "wm", "size"]))
+        let speed = Double(adb(["shell", "settings", "get", "system", "pointer_speed"]))
+        DispatchQueue.main.async {
+            deviceName = name; screenSize = size
+            if let speed { ui.cursorSlider.doubleValue = speed }
+        }
+    }
+}
+
+// 이 앱이 띄운 scrcpy는 SIGTERM/SIGINT를 무시해서, 맥 앱 종료 요청으로 끄고 안 되면 강제 종료한다.
+func disconnect() {
+    guard let p = scrcpyProcess else { return }
+    if let app = scrcpy ?? NSRunningApplication(processIdentifier: p.processIdentifier), app.terminate() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if p.isRunning { kill(p.processIdentifier, SIGKILL) } }
+    } else {
+        kill(p.processIdentifier, SIGKILL)
+    }
+}
+
+func disconnected() {
+    if onAndroid { leave(activatePrevious: true) }
+    let wasConnected = scrcpy != nil
+    scrcpyProcess = nil; scrcpy = nil; pid = 0
+    shells.values.forEach { $0.process.terminate() }; shells = [:]
+    ui.update(wasConnected ? "연결 안 됨" : "연결 실패 · 폰이 연결돼 있고 USB 디버깅이 켜져 있는지 확인하세요")
+}
+
+// MARK: 스크롤 — scrcpy 2.7의 가상 휠은 트랙패드 스크롤을 제대로 못 옮긴다
+// (작은 스크롤은 0칸, 스크롤 이벤트 하나가 휠 20칸이 되기도 함). 그래서 맥 스크롤 이벤트는 버리고
+// 이동량을 모아 30ms마다 폰의 `input mouse scroll`(소수 단위 가능, 약 20ms)로 커서 위치에 보낸다.
+var scrollAcc = 0.0
 
 // MARK: 키보드 — 폰에 있을 때는 모든 키를 scrcpy에만 보내서 맥 단축키(Cmd+Tab, Cmd+Space…)가 맥에서 실행되지 않게 한다.
 // 맥 습관 그대로 쓰도록 Cmd ↔ Ctrl을 바꿔 보낸다: Cmd+C → 안드로이드 Ctrl+C.
@@ -98,12 +192,6 @@ func swapCmdCtrl(_ raw: UInt64) -> UInt64 {
 }
 assert(swapCmdCtrl(0x100008) == 0x40001)
 
-// MARK: 스크롤 — scrcpy 2.7의 가상 휠은 트랙패드 스크롤을 제대로 못 옮긴다
-// (작은 스크롤은 0칸, 스크롤 이벤트 하나가 휠 20칸이 되기도 함). 그래서 맥 스크롤 이벤트는 버리고
-// 이동량을 모아 30ms마다 폰의 `input mouse scroll`(소수 단위 가능, 약 20ms)로 커서 위치에 보낸다.
-let scrollPointsPerStep = 50.0  // 안드로이드 휠 한 칸에 해당하는 맥 스크롤 거리(pt). 작을수록 빨리 스크롤
-var scrollAcc = 0.0
-
 // 회전·제스처 시작/끝·제스처·확대(독 스와이프)·스와이프: 폰에 있을 때는 맥이 반응하지 않게 버린다.
 let gestureTypes: [UInt32] = [18, 19, 20, 29, 30, 31]
 var tap: CFMachPort?
@@ -116,8 +204,10 @@ func handleTap(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
     }
     guard onAndroid else { return Unmanaged.passUnretained(event) }
     if gestureTypes.contains(type.rawValue) { return nil }
-    if type == .scrollWheel {  // 세로만. 가로는 두 손가락 슬라이드가 맡는다
-        scrollAcc += event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1) / scrollPointsPerStep
+    if type == .scrollWheel {
+        let v = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
+        let h = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
+        if abs(v) >= abs(h) { scrollAcc += v / scrollPointsPerStep }  // 가로 위주 움직임은 두 손가락 슬라이드가 맡는다
         return nil
     }
     guard let e = event.copy() else { return nil }
@@ -126,59 +216,17 @@ func handleTap(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
     e.postToPid(pid)
     return nil
 }
-tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: tapMask,
-                        callback: { _, type, event, _ in handleTap(type, event) }, userInfo: nil)
-if let tap {
-    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
-} else {
-    print("키보드 가로채기 실패: 손쉬운 사용 권한을 확인하세요. (단축키가 맥에서도 실행됩니다)")
-}
 
 // MARK: 트랙패드 제스처 — 폰에 있을 때 손가락 제스처를 안드로이드 동작으로 바꾼다.
-// 두 손가락 가로: 화면 슬라이드(터치 스와이프). 두 손가락 세로는 scrcpy가 스크롤로 보낸다.
+// 두 손가락 가로: 화면 슬라이드(터치 스와이프). 두 손가락 세로: 위의 스크롤.
 // 세 손가락 이상, 맥과 같은 느낌: 오른쪽 = 뒤로, 왼쪽 = 앞으로, 위 = 최근 앱(Mission Control), 아래 = 홈.
 let swipeDistance = 0.12  // 세 손가락: 트랙패드 폭 대비 이동 비율. 너무 민감/둔하면 조절
 let slideDistance = 0.15  // 두 손가락 가로 슬라이드 판정 거리
-signal(SIGPIPE, SIG_IGN)
-var shell: FileHandle?
-func androidShell(_ command: String, _ name: String? = nil) {
-    if shell == nil {
-        let p = Process(), pipe = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["adb", "shell"]
-        p.standardInput = pipe
-        p.standardOutput = FileHandle.nullDevice
-        try? p.run()
-        shell = pipe.fileHandleForWriting
-    }
-    shell?.write(Data("\(command)\n".utf8))
-    if let name { print("  제스처: \(name)") }
-}
-func androidKey(_ code: Int, _ name: String) { androidShell("input keyevent \(code)", name) }
-
-// "Physical size: 1080x2340" / "Override size: ..." 중 마지막 값 (덮어쓴 해상도가 있으면 그것)
-func parseSize(_ text: String) -> (w: Int, h: Int)? {
-    guard let last = text.split(separator: "\n").last(where: { $0.contains("size:") }),
-          let dims = last.split(separator: " ").last?.split(separator: "x"), dims.count == 2,
-          let w = Int(dims[0]), let h = Int(dims[1]) else { return nil }
-    return (w, h)
-}
-assert(parseSize("Physical size: 1080x2340\nOverride size: 720x1560")! == (720, 1560))
-
-// ponytail: 화면 크기는 시작할 때 한 번만 읽는다. 폰을 가로로 돌리면 슬라이드가 세로 기준이 됨 — 필요하면 매번 읽기.
-let screenSize: (w: Int, h: Int)? = {
-    let p = Process(), pipe = Pipe()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = ["adb", "shell", "wm", "size"]
-    p.standardOutput = pipe
-    try? p.run(); p.waitUntilExit()
-    return parseSize(String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
-}()
 
 func androidSlide(toLeft: Bool) {
     guard let (w, h) = screenSize else { return }
     let (from, to) = toLeft ? (w * 4 / 5, w / 5) : (w / 5, w * 4 / 5)
-    androidShell("input swipe \(from) \(h / 2) \(to) \(h / 2) 150", toLeft ? "← 슬라이드" : "→ 슬라이드")
+    androidShell("input swipe \(from) \(h / 2) \(to) \(h / 2) 120", toLeft ? "← 슬라이드" : "→ 슬라이드")
 }
 
 var gestureStart: (x: Double, y: Double, fingers: Int)?, gestureFired = false
@@ -206,41 +254,147 @@ func handleTouches(_ n: Int, _ x: Double, _ y: Double) {
 // 비공개 MultitouchSupport 프레임워크로 손가락 좌표를 읽는다 (BetterTouchTool 등이 쓰는 방식).
 // 손가락 구조체는 96바이트, 정규화 좌표 x,y는 32/36 바이트 위치의 Float (y는 위로 갈수록 커짐).
 typealias MTCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
-let mt = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW)
-func mtSym<T>(_ name: String, _: T.Type) -> T? { dlsym(mt, name).map { unsafeBitCast($0, to: T.self) } }
-if let createList = mtSym("MTDeviceCreateList", (@convention(c) () -> Unmanaged<CFArray>).self),
-   let register = mtSym("MTRegisterContactFrameCallback", (@convention(c) (UnsafeMutableRawPointer, MTCallback) -> Void).self),
-   let start = mtSym("MTDeviceStart", (@convention(c) (UnsafeMutableRawPointer, Int32) -> Void).self) {
+func onTouchFrame(_ touches: UnsafeMutableRawPointer?, _ n: Int32) -> Int32 {
+    guard let touches else { return 0 }
+    var x = 0.0, y = 0.0
+    for f in 0..<Int(n) {
+        x += Double(touches.load(fromByteOffset: f * 96 + 32, as: Float.self))
+        y += Double(touches.load(fromByteOffset: f * 96 + 36, as: Float.self))
+    }
+    let count = Int(n)
+    if count > 0 { x /= Double(count); y /= Double(count) }
+    DispatchQueue.main.async { handleTouches(count, x, y) }
+    return 0
+}
+func startMultitouch() {
+    let mt = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW)
+    func sym<T>(_ name: String, _: T.Type) -> T? { dlsym(mt, name).map { unsafeBitCast($0, to: T.self) } }
+    guard let createList = sym("MTDeviceCreateList", (@convention(c) () -> Unmanaged<CFArray>).self),
+          let register = sym("MTRegisterContactFrameCallback", (@convention(c) (UnsafeMutableRawPointer, MTCallback) -> Void).self),
+          let start = sym("MTDeviceStart", (@convention(c) (UnsafeMutableRawPointer, Int32) -> Void).self) else {
+        print("트랙패드 제스처를 읽을 수 없습니다 (MultitouchSupport 없음)."); return
+    }
     let devices = createList().takeRetainedValue()
     for i in 0..<CFArrayGetCount(devices) {
         let dev = UnsafeMutableRawPointer(mutating: CFArrayGetValueAtIndex(devices, i)!)
         register(dev) { _, touches, n, _, _ in onTouchFrame(touches, n) }
         start(dev, 0)
     }
-} else {
-    print("트랙패드 제스처를 읽을 수 없습니다 (MultitouchSupport 없음).")
 }
-func onTouchFrame(_ touches: UnsafeMutableRawPointer?, _ n: Int32) -> Int32 {
-            guard let touches else { return 0 }
-            var x = 0.0, y = 0.0
-            for f in 0..<Int(n) {
-                x += Double(touches.load(fromByteOffset: f * 96 + 32, as: Float.self))
-                y += Double(touches.load(fromByteOffset: f * 96 + 36, as: Float.self))
-            }
-            let count = Int(n)
-            if count > 0 { x /= Double(count); y /= Double(count) }
-            DispatchQueue.main.async { handleTouches(count, x, y) }
-            return 0
+
+// MARK: 창 — 연결/연결 해제, 커서 속도, 스크롤 속도
+final class UI: NSObject, NSApplicationDelegate {
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 10),
+                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+    let status = NSTextField(wrappingLabelWithString: "연결 안 됨")
+    lazy var connectButton = NSButton(title: "연결", target: self, action: #selector(connectTapped))
+    lazy var disconnectButton = NSButton(title: "연결 해제", target: self, action: #selector(disconnectTapped))
+    lazy var cursorSlider = slider(-7, 7, 0, #selector(cursorChanged))
+    lazy var scrollSlider = slider(1, 10, scrollSpeed, #selector(scrollChanged))
+
+    func slider(_ min: Double, _ max: Double, _ value: Double, _ action: Selector) -> NSSlider {
+        let s = NSSlider(value: value, minValue: min, maxValue: max, target: self, action: action)
+        s.numberOfTickMarks = Int(max - min) + 1
+        s.allowsTickMarkValuesOnly = true
+        s.isContinuous = false  // 손을 뗄 때 한 번 적용
+        s.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        return s
+    }
+
+    func row(_ title: String, _ control: NSView) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        return NSStackView(views: [label, control])
+    }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        status.font = .boldSystemFont(ofSize: 13)
+        status.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        let hint = NSTextField(wrappingLabelWithString: "맥 화면 오른쪽 끝으로 커서를 밀면 폰으로, 폰 화면 왼쪽 끝으로 밀면 맥으로 돌아옵니다.")
+        hint.textColor = .secondaryLabelColor
+        hint.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        let stack = NSStackView(views: [
+            status,
+            NSStackView(views: [connectButton, disconnectButton]),
+            row("커서 속도", cursorSlider),
+            row("스크롤 속도", scrollSlider),
+            hint,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        window.contentView = stack
+        window.title = "droidlink"
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        update("연결 안 됨")
+        connect()
+    }
+
+    func update(_ text: String) {
+        let connected = scrcpyProcess != nil
+        status.stringValue = text
+        connectButton.isEnabled = !connected
+        disconnectButton.isEnabled = connected
+        cursorSlider.isEnabled = connected
+    }
+
+    @objc func connectTapped() { connect() }
+    @objc func disconnectTapped() { disconnect() }
+    @objc func cursorChanged() {
+        let speed = Int(cursorSlider.doubleValue.rounded())
+        DispatchQueue.global().async { _ = adb(["shell", "settings", "put", "system", "pointer_speed", "\(speed)"]) }
+    }
+    @objc func scrollChanged() {
+        scrollSpeed = scrollSlider.doubleValue.rounded()
+        UserDefaults.standard.set(scrollSpeed, forKey: "scrollSpeed")
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ note: Notification) {
+        poller?.terminate()
+        shells.values.forEach { $0.process.terminate() }
+        if let p = scrcpyProcess { kill(p.processIdentifier, SIGKILL) }  // 앱이 끝나는 중이라 기다리지 않는다
+    }
+}
+
+// MARK: 시작
+if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
+    print("손쉬운 사용 권한이 필요합니다: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 이 터미널을 켜고 다시 실행하세요.")
+}
+tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: tapMask,
+                        callback: { _, type, event, _ in handleTap(type, event) }, userInfo: nil)
+if let tap {
+    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+} else {
+    print("키보드 가로채기 실패: 손쉬운 사용 권한을 확인하세요. (단축키가 맥에서도 실행됩니다)")
+}
+startMultitouch()
+
+// 터미널에서 Ctrl+C로 끝내도 scrcpy까지 정리되게 한다
+let signalSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { NSApp.terminate(nil) }
+    source.resume()
+    return source
 }
 
 Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { _ in
     guard onAndroid, abs(scrollAcc) >= 0.05, let pos = androidPos else { return }
-    androidShell(String(format: "input mouse scroll %.0f %.0f --axis VSCROLL,%.3f", pos.x, pos.y, scrollAcc))
+    androidShell(String(format: "input mouse scroll %.0f %.0f --axis VSCROLL,%.3f", pos.x, pos.y, scrollAcc), channel: "scroll")
     scrollAcc = 0
 }
 
 Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
-    if scrcpy.isTerminated { poller?.terminate(); exit(0) }
+    // scrcpy 창이 뜨면 연결 완료
+    if scrcpy == nil, pid != 0, scrcpyWindowCenter() != nil {
+        scrcpy = NSRunningApplication(processIdentifier: pid)
+        ui.update("연결됨 · \(deviceName.isEmpty ? "안드로이드" : deviceName)")
+    }
+    guard let scrcpy else { return }
     if !onAndroid {
         if cursor().x >= rightEdge() - edgeMargin { enter() }
         return
@@ -251,5 +405,8 @@ Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
     if x > armX { armed = true }
     if armed && x <= 0.5 { leave(activatePrevious: true) }
 }
-print("droidlink: 맥 화면 오른쪽 끝으로 커서를 밀면 폰으로, 폰 화면 왼쪽 끝으로 밀면 맥으로 돌아옵니다.")
-RunLoop.main.run()
+
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+app.delegate = ui
+app.run()

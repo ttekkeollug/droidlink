@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # droidlink: 맥북 키보드/트랙패드를 안드로이드의 실제 HID 키보드·마우스로 연결한다.
-# scrcpy의 UHID 모드를 화면 미러링 없이 사용 (입력 전용 창만 뜸).
+# scrcpy의 UHID 모드를 화면 미러링 없이 사용하고, 설정 창(edge.swift)이 연결·전환을 맡는다.
 set -euo pipefail
 
 usage() {
@@ -13,6 +13,7 @@ usage() {
 
 맥 화면 오른쪽 끝으로 커서를 밀면 키보드·마우스가 폰으로 넘어가고,
 폰 화면 왼쪽 끝으로 밀면 맥으로 돌아온다. 키보드 단축키와 트랙패드 제스처도 커서가 있는 쪽에서 동작한다.
+droidlink 창에서 연결/연결 해제, 커서 속도, 스크롤 속도를 바꿀 수 있다.
 EOF
 }
 
@@ -22,27 +23,19 @@ for bin in adb scrcpy; do
   command -v "$bin" >/dev/null || { echo "'$bin'이 없습니다: brew install scrcpy android-platform-tools" >&2; exit 1; }
 done
 
-video=(--no-video --no-audio --window-width=240 --window-height=80)
+mirror=()
 case "${1:-}" in
   pair)
     [ $# -eq 3 ] || { usage >&2; exit 1; }
     exec adb pair "$2" "$3" ;;
-  mirror) video=(); shift ;;
+  mirror) mirror=(--mirror); shift ;;
 esac
 
-serial=()
 if [ -n "${1:-}" ]; then
   adb connect "$1"
-  serial=(--serial "$1")
+  export ANDROID_SERIAL="$1"
 fi
 
 dir=$(dirname "$(readlink -f "$0")")
 [ "$dir/edge" -nt "$dir/edge.swift" ] || swiftc -suppress-warnings "$dir/edge.swift" -o "$dir/edge"
-
-scrcpy "${serial[@]+"${serial[@]}"}" "${video[@]+"${video[@]}"}" \
-  --keyboard=uhid --mouse=uhid --stay-awake --window-title=droidlink --always-on-top --shortcut-mod=rsuper &
-pid=$!
-trap 'kill $pid 2>/dev/null' EXIT
-sleep 2  # scrcpy 창이 뜰 때까지
-[ -z "${1:-}" ] || export ANDROID_SERIAL="$1"
-"$dir/edge" "$pid"
+exec "$dir/edge" "${mirror[@]+"${mirror[@]}"}"
