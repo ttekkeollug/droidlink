@@ -237,7 +237,7 @@ func applyKey(type: CGEventType, keycode: Int64, flags: UInt64, isRepeat: Bool) 
             if flags & m.macBit != 0 { hidMods |= m.hidBit } else { hidMods &= ~m.hidBit }
             return true
         }
-        return false  // Caps Lock은 keyDown으로도 오지 않으니 아래에서 따로 처리
+        return false  // 한/영(Caps Lock)은 handleTap에서 따로 처리
     }
     guard !isRepeat, let usage = hidUsage[keycode] else { return false }  // 키 반복은 안드로이드가 알아서 한다
     if type == .keyDown { if !hidKeys.contains(usage) && hidKeys.count < 6 { hidKeys.append(usage) } }
@@ -263,6 +263,21 @@ func sendMouse(dx: Int, dy: Int) {
         dx -= x; dy -= y
     } while dx != 0 || dy != 0
 }
+// 한/영: 맥에서는 Caps Lock 키가 한/영 전환이다. 갤럭시(삼성 키보드)는 물리 키보드에서 Shift+Space로 한/영을 바꾸므로 그렇게 보낸다.
+// 키 하나에 이벤트가 두 번 오는 경우가 있어 0.3초 안의 반복은 무시한다.
+let languageSwitchCombo: (mods: UInt8, key: UInt8) = (0x02, 0x2C)  // 왼쪽 Shift + Space
+var lastLanguageSwitch = Date.distantPast
+func sendLanguageSwitch() {
+    guard Date().timeIntervalSince(lastLanguageSwitch) > 0.3 else { return }
+    lastLanguageSwitch = Date()
+    let saved = hidMods
+    hidMods |= languageSwitchCombo.mods; sendKeyboard()
+    hidKeys.append(languageSwitchCombo.key); sendKeyboard()
+    hidKeys.removeAll { $0 == languageSwitchCombo.key }; sendKeyboard()
+    hidMods = saved; sendKeyboard()
+    print("  한/영")
+}
+
 func releaseAll() {  // 맥으로 돌아올 때 눌린 채 남는 키·버튼이 없게
     hidKeys = []; hidMods = 0; hidButtons = 0
     sendKeyboard(); sendMouse(dx: 0, dy: 0)
@@ -463,6 +478,7 @@ func disconnected() {
 var scrollAcc = 0.0
 
 // MARK: 이벤트 탭 — 폰에 있는 동안 맥의 키·마우스·스크롤·제스처 이벤트를 모두 가로채 폰으로 보낸다 (맥에서는 아무 일도 안 일어남)
+let debugKeys = ProcessInfo.processInfo.environment["DROIDLINK_DEBUG"] != nil  // 키 이벤트를 터미널에 찍는다
 let gestureTypes: [UInt32] = [18, 19, 20, 29, 30, 31]  // 회전·제스처 시작/끝·제스처·확대(독 스와이프)·스와이프
 let mouseMoveTypes: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
 let mouseButtonTypes: [CGEventType: (bit: UInt8, down: Bool)] = [
@@ -497,8 +513,9 @@ func handleTap(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         if abs(v) >= abs(h) { scrollAcc += v / scrollPointsPerStep }  // 가로 위주 움직임은 두 손가락 슬라이드가 맡는다
     } else if type == .keyDown || type == .keyUp || type == .flagsChanged {
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
-        if type == .flagsChanged && keycode == 57 {  // Caps Lock: 누를 때마다 한 번 눌렀다 뗀다
-            hidKeys.append(0x39); sendKeyboard(); hidKeys.removeAll { $0 == 0x39 }; sendKeyboard()
+        if debugKeys { print("  키 이벤트 type=\(type.rawValue) keycode=\(keycode) flags=0x\(String(event.flags.rawValue, radix: 16))") }
+        if keycode == 57 {  // 한/영(Caps Lock)
+            if type != .keyUp { sendLanguageSwitch() }
         } else if applyKey(type: type, keycode: keycode, flags: event.flags.rawValue,
                            isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0) {
             sendKeyboard()
