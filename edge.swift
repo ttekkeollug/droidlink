@@ -583,7 +583,9 @@ Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
     // 다른 이유로 scrcpy 창이 포커스를 잃은 경우
     if !scrcpy.isActive && Date().timeIntervalSince(enteredAt) > 1 { leave(activatePrevious: false); return }
     guard let x = androidPos?.x else { return }
-    if x > armX { armed = true }
+    // 들어올 때 scrcpy 창으로 커서를 옮기며 생기는 큰 왼쪽 이동이 폰 커서를 왼쪽 끝으로 보낸다.
+    // 그 직후의 위치로 판정하면 바로 돌아오므로, 들어온 뒤 잠시 지나서 오른쪽으로 들어간 것만 인정한다.
+    if x > armX && Date().timeIntervalSince(enteredAt) > 0.6 { armed = true }
     if armed && x <= 0.5 { leave(activatePrevious: true) }
 }
 
