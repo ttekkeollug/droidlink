@@ -121,15 +121,17 @@ func enter() {
     print("→ 폰 (이전 앱: \(previousApp?.localizedName ?? "-"))")
 }
 
+// scrcpy가 포커스를 잃으면 마우스를 놓는다. macOS는 활성 앱만 포커스를 넘길 수 있어 이 앱을 먼저 활성화한다.
+func giveFocusBack() {
+    NSApp.activate(ignoringOtherApps: true)
+    if let previousApp, previousApp != scrcpy, previousApp != NSRunningApplication.current { previousApp.activate() }
+}
+
 func leave(activatePrevious: Bool) {
     print(activatePrevious ? "→ 맥 (폰 왼쪽 끝)" : "→ 맥 (scrcpy 포커스 잃음)")
     onAndroid = false
     poller?.terminate(); poller = nil
-    if activatePrevious {  // 포커스를 잃으면 scrcpy가 마우스를 놓는다
-        // macOS는 활성 앱만 다른 앱에 포커스를 넘길 수 있어서, 먼저 이 앱을 활성화한 뒤 이전 앱으로 넘긴다
-        NSApp.activate(ignoringOtherApps: true)
-        if let previousApp, previousApp != NSRunningApplication.current { previousApp.activate() }
-    }
+    if activatePrevious { giveFocusBack() }
     CGWarpMouseCursorPosition(CGPoint(x: rightEdge() - returnInset, y: enterY))
 }
 
@@ -223,6 +225,7 @@ func launchScrcpy(_ device: String) {
     p.terminationHandler = { _ in DispatchQueue.main.async { disconnected() } }
     guard (try? p.run()) != nil else { ui.update("scrcpy를 실행할 수 없습니다"); return }
     scrcpyProcess = p; pid = p.processIdentifier
+    if let front = NSWorkspace.shared.frontmostApplication, front != NSRunningApplication.current { previousApp = front }
     ui.update("연결 중… (\(isWireless(device) ? "Wi-Fi" : "USB"))")
     DispatchQueue.global().async {
         let name = adb(["shell", "getprop", "ro.product.model"])
@@ -297,6 +300,13 @@ func handleTap(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
+    }
+    // 비상 탈출: Cmd+Option+Esc (맥 강제 종료 단축키)를 누르면 언제든 맥으로 돌아온다
+    if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53,
+       event.flags.contains([.maskCommand, .maskAlternate]), onAndroid || scrcpy?.isActive == true {
+        print("→ 맥 (Cmd+Option+Esc)")
+        onAndroid ? leave(activatePrevious: true) : giveFocusBack()
+        return nil
     }
     guard onAndroid else { return Unmanaged.passUnretained(event) }
     if gestureTypes.contains(type.rawValue) { return nil }
@@ -455,6 +465,13 @@ final class UI: NSObject, NSApplicationDelegate {
         connect()
     }
 
+    var warnedPermission = false
+    func warnPermission() {
+        guard !warnedPermission else { return }
+        warnedPermission = true
+        status.stringValue = "손쉬운 사용 권한이 필요합니다 · 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 droidlink를 지웠다가 다시 켜고, 앱을 다시 여세요"
+    }
+
     func update(_ text: String) {
         let connected = scrcpyProcess != nil
         status.stringValue = text
@@ -577,6 +594,10 @@ Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
     }
     guard let scrcpy else { return }
     if !onAndroid {
+        // scrcpy 창이 포커스를 가지면 마우스·키보드를 잡아 버리므로, 맥에 있는 동안은 절대 포커스를 주지 않는다
+        if scrcpy.isActive { giveFocusBack(); return }
+        // 권한이 없으면 scrcpy 창을 클릭해 마우스를 잡게 할 수 없어 폰에서 못 돌아온다 — 넘어가지 않는다
+        guard AXIsProcessTrusted() else { ui.warnPermission(); return }
         if cursor().x >= rightEdge() - edgeMargin { enter() }
         return
     }
