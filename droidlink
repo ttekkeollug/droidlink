@@ -1,41 +1,36 @@
 #!/usr/bin/env bash
-# droidlink: 맥북 키보드/트랙패드를 안드로이드의 실제 HID 키보드·마우스로 연결한다.
-# scrcpy의 UHID 모드를 화면 미러링 없이 사용하고, 설정 창(edge.swift)이 연결·전환을 맡는다.
+# droidlink: 맥북 키보드/트랙패드를 안드로이드에 실제 키보드·마우스(UHID)로 연결한다.
+# 터미널용 실행기 — droidlink.app을 만들어(처음 한 번) 그 안의 앱을 터미널에서 띄운다.
 set -euo pipefail
 
 usage() {
-  cat <<EOF
+  cat <<USAGE
 사용법:
-  droidlink                     USB로 연결된 폰에 연결
-  droidlink IP:PORT             무선 디버깅으로 연결 (예: 192.168.0.12:37123)
+  droidlink                     droidlink 창을 띄우고 연결 (USB 우선, 없으면 무선)
+  droidlink IP:PORT             이 주소로 무선 연결
   droidlink pair IP:PORT CODE   무선 디버깅 페어링 (안드로이드 11+, 최초 1회)
-  droidlink mirror [IP:PORT]    화면 미러링까지 같이 켜기
 
-맥 화면 오른쪽 끝으로 커서를 밀면 키보드·마우스가 폰으로 넘어가고,
-폰 화면 왼쪽 끝으로 밀면 맥으로 돌아온다. 키보드 단축키와 트랙패드 제스처도 커서가 있는 쪽에서 동작한다.
-droidlink 창에서 연결/연결 해제, 커서 속도, 스크롤 속도를 바꿀 수 있다.
-EOF
+맥 화면 끝으로 커서를 밀면 키보드·마우스가 폰으로 넘어가고, 폰 화면 반대쪽 끝으로 밀면 맥으로 돌아온다.
+폰 위치(왼쪽/오른쪽), 커서·스크롤 속도, 무선·블루투스 연결은 droidlink 창에서 바꾼다. 막히면 Cmd+Option+Esc.
+USAGE
 }
 
+dir=$(dirname "$(readlink -f "$0")")
+app="$dir/droidlink.app/Contents/MacOS/droidlink"
+adb="$dir/droidlink.app/Contents/Resources/scrcpy/adb"
+
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+# 소스가 앱보다 새로우면 다시 만든다
+[ -x "$app" ] && [ "$app" -nt "$dir/edge.swift" ] || "$dir/build-app.sh" >/dev/null
 
-for bin in adb scrcpy; do
-  command -v "$bin" >/dev/null || { echo "'$bin'이 없습니다: brew install scrcpy android-platform-tools" >&2; exit 1; }
-done
-
-mirror=()
 case "${1:-}" in
   pair)
     [ $# -eq 3 ] || { usage >&2; exit 1; }
-    exec adb pair "$2" "$3" ;;
-  mirror) mirror=(--mirror); shift ;;
+    exec "$adb" pair "$2" "$3" ;;
+  "") ;;
+  *)
+    "$adb" connect "$1"
+    export ANDROID_SERIAL="$1" ;;
 esac
 
-if [ -n "${1:-}" ]; then
-  adb connect "$1"
-  export ANDROID_SERIAL="$1"
-fi
-
-dir=$(dirname "$(readlink -f "$0")")
-[ "$dir/edge" -nt "$dir/edge.swift" ] || swiftc -suppress-warnings "$dir/edge.swift" -o "$dir/edge"
-exec "$dir/edge" "${mirror[@]+"${mirror[@]}"}"
+exec "$app"

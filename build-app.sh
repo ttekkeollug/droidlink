@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # droidlink.app (Apple Silicon + Intel 공용)을 만들고 배포용 zip으로 묶는다.
-# scrcpy 공식 macOS 빌드(adb·scrcpy-server 포함)를 받아 앱 안에 넣으므로 Homebrew 없이 동작한다.
+# scrcpy 공식 macOS 빌드에서 adb와 scrcpy-server만 꺼내 앱 안에 넣는다 (scrcpy 창 앱은 쓰지 않음). Homebrew 없이 동작한다.
 # 사용: ./build-app.sh [버전]   → droidlink.app, droidlink-macos.zip
 set -euo pipefail
 cd "$(dirname "$0")"
 version="${1:-1.0.0}"
-scrcpy_version=5.0.1
+scrcpy_version=5.0.1  # edge.swift의 scrcpyVersion과 같아야 한다
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -29,29 +29,12 @@ if [ ! -d "$cache/x86_64" ]; then
 fi
 
 rm -rf droidlink.app droidlink-macos.zip
-helper=droidlink.app/Contents/Helpers/droidlink-input.app/Contents
-mkdir -p droidlink.app/Contents/MacOS droidlink.app/Contents/Resources/scrcpy "$helper/MacOS"
+mkdir -p droidlink.app/Contents/MacOS droidlink.app/Contents/Resources/scrcpy
 lipo -create "$tmp/edge-arm64" "$tmp/edge-x86_64" -output droidlink.app/Contents/MacOS/droidlink
 tools=droidlink.app/Contents/Resources/scrcpy
 cp "$cache/aarch64/adb" "$cache/aarch64/scrcpy-server" "$tools/"  # adb는 이미 universal, 서버는 두 빌드가 같다
 cp "$cache/aarch64/LICENSE" "$tools/LICENSE-scrcpy"
-# scrcpy는 작은 도우미 앱으로 감싸서 Dock에 "droidlink 입력"으로 보이게 한다 (scrcpy가 쓰는 SDL이 Dock 숨김을 막음)
-lipo -create "$cache/aarch64/scrcpy" "$cache/x86_64/scrcpy" -output "$helper/MacOS/scrcpy"
-cat > "$helper/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>droidlink 입력</string>
-  <key>CFBundleIdentifier</key><string>com.ttekkeollug.droidlink.input</string>
-  <key>CFBundleExecutable</key><string>scrcpy</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$version</string>
-  <key>LSUIElement</key><true/>
-</dict>
-</plist>
-EOF
-codesign --force --sign - "$tools/adb" "$helper/.."
+codesign --force --sign - "$tools/adb"
 cat > droidlink.app/Contents/Info.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

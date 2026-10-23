@@ -2,13 +2,14 @@
 
 맥북 키보드와 트랙패드를 안드로이드 폰에 **실제 키보드·마우스처럼** 연결해서 쓰는 macOS용 앱. USB, Wi-Fi, 블루투스 테더링으로 연결할 수 있다.
 
-내부적으로 [scrcpy](https://github.com/Genymobile/scrcpy)의 UHID 모드를 사용한다. 폰 쪽에 따로 앱을 설치할 필요가 없고, 한/영 전환·단축키·마우스 커서가 안드로이드에서 그대로 동작한다.
+폰에는 [scrcpy](https://github.com/Genymobile/scrcpy)의 서버만 잠깐 띄우고, 맥의 키보드·트랙패드 입력은 droidlink가 직접 폰의 가상 USB 키보드·마우스로 보낸다.
+폰에 앱을 설치할 필요가 없고, 맥에는 droidlink 창 하나만 뜬다.
 
 ## 설치
 
 ### 앱으로 (추천)
 
-앱 안에 [scrcpy](https://github.com/Genymobile/scrcpy) 5.0.1과 adb가 들어 있어서 따로 설치할 것이 없다.
+앱 안에 adb와 scrcpy 5.0.1 서버가 들어 있어서 따로 설치할 것이 없다.
 
 1. [Releases](https://github.com/ttekkeollug/droidlink/releases/latest)에서 `droidlink-macos.zip`을 받아 풀고 `droidlink.app`을 **응용 프로그램** 폴더로 옮긴다.
 2. 처음 한 번은 `droidlink.app`을 **우클릭 → 열기**. (개발자 서명이 없는 앱이라 그냥 더블클릭하면 막힌다)
@@ -18,25 +19,21 @@
 ### 터미널로
 
 ```bash
-brew install scrcpy android-platform-tools
 git clone https://github.com/ttekkeollug/droidlink && cd droidlink
 ln -s "$PWD/droidlink" /usr/local/bin/droidlink
 ```
 
-터미널 버전은 Homebrew의 scrcpy·adb를 쓴다.
-
-직접 앱으로 빌드하려면 `./build-app.sh` — scrcpy 공식 macOS 빌드를 받아(체크섬 확인) 앱에 넣고,
-universal `droidlink.app`과 `droidlink-macos.zip`을 만든다. 앱이 연결 중일 때 Dock에 보이는 **droidlink 입력**은 앱 안에 든 scrcpy다.
+`droidlink`를 처음 실행하면 `./build-app.sh`로 앱을 만든다 (Xcode Command Line Tools 필요).
+`build-app.sh`는 scrcpy 공식 macOS 빌드를 받아(체크섬 확인) adb와 서버만 앱에 넣고, universal `droidlink.app`과 `droidlink-macos.zip`을 만든다.
 
 폰: **설정 → 휴대전화 정보 → 빌드번호 7번 탭** → 개발자 옵션 → **USB 디버깅** 켜기.
 
 ## 사용
 
 ```bash
-droidlink                          # USB 케이블 연결
+droidlink                          # 창을 띄우고 연결 (USB 우선, 없으면 무선)
 droidlink pair 192.168.0.12:41234 123456   # 무선 디버깅 페어링 (최초 1회, Android 11+)
-droidlink 192.168.0.12:37123       # 와이파이로 연결
-droidlink mirror                   # 화면 미러링도 같이
+droidlink 192.168.0.12:37123       # 이 주소로 무선 연결
 ```
 
 ### droidlink 창
@@ -88,16 +85,15 @@ droidlink mirror                   # 화면 미러링도 같이
 커서가 맥으로 돌아오면 모든 단축키와 제스처가 원래대로 맥에서 동작한다.
 제스처 감도는 `edge.swift`의 `swipeDistance`(세 손가락), `slideDistance`(두 손가락)로 조절한다.
 
-작은 `droidlink 입력` 창(항상 위)이 폰으로 갈 입력을 받는 창이다.
+처음 실행할 때 **손쉬운 사용 권한**을 묻는다: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 droidlink(터미널에서 실행했다면 터미널 앱)를 켠다.
 
-처음 실행할 때 **손쉬운 사용 권한**을 묻는다: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용에서 터미널 앱을 켠다.
-
-동작 원리: `edge.swift`가 맥 커서 위치를 보고 있다가 오른쪽 끝에 닿으면 scrcpy 창을 클릭해 마우스를 잡게 하고,
-폰 커서 위치는 `adb shell dumpsys input`으로 읽어 왼쪽 끝(x=0)에 닿으면 원래 앱으로 포커스를 돌려준다.
-폰에 있는 동안 키 입력은 이벤트 탭으로 가로채 scrcpy에만 보내고, 트랙패드 제스처는 MultitouchSupport로 읽어 `input keyevent` / `input swipe`로 바꾼다.
-세로 스크롤은 scrcpy 가상 휠 대신 맥 스크롤량을 모아 `input mouse scroll`로 커서 위치에 보낸다 (scrcpy 2.7 휠은 트랙패드의 작은 스크롤을 잃어버림).
+동작 원리:
+- 연결하면 adb로 폰에 scrcpy 서버를 영상·소리 없이 띄우고, adb 터널로 제어 소켓 하나만 연결해 가상 USB 키보드·마우스(UHID)를 만든다.
+- `edge.swift`가 맥 커서 위치를 보고 있다가 화면 끝에 닿으면 맥 커서를 멈추고 숨긴 뒤, 이벤트 탭으로 키·마우스 이벤트를 가로채 가상 키보드·마우스 보고서로 보낸다.
+- 폰 커서 위치는 `adb shell dumpsys input`으로 읽어 돌아가는 쪽 끝에 닿으면 맥 커서를 풀어 준다.
+- 트랙패드 제스처는 MultitouchSupport로 읽어 `input keyevent` / `input swipe`로, 세로 스크롤은 스크롤량을 모아 `input mouse scroll`로 보낸다.
 
 ## 요구사항
 
-- macOS (Xcode Command Line Tools: `swiftc`), scrcpy 2.4+
+- macOS 13 이상 (직접 빌드할 때는 Xcode Command Line Tools: `swiftc`)
 - Android 9+ (UHID), 무선은 Android 11+
