@@ -1,6 +1,6 @@
-// edge: droidlink 본체. scrcpy를 띄우고 끄는 창(연결/연결 해제, 커서·스크롤 속도)을 보여 주고,
+// edge: droidlink 본체. scrcpy를 띄우고 끄는 창(USB·Wi-Fi·블루투스 연결, 커서·스크롤 속도)을 보여 주고,
 // 맥 화면 오른쪽 끝 ↔ 안드로이드 화면 왼쪽 끝으로 커서·키보드·트랙패드를 넘긴다.
-// 사용: edge [--mirror]   (ANDROID_SERIAL로 기기 지정 가능)
+// 사용: edge [--mirror]   (ANDROID_SERIAL로 기기 지정 가능). droidlink.app으로 묶으면 Finder에서 바로 실행된다.
 import AppKit
 
 let edgeMargin = 1.0      // 맥 오른쪽 끝 판정 여유(px)
@@ -10,16 +10,18 @@ let mirror = CommandLine.arguments.contains("--mirror")
 let launchSerial = ProcessInfo.processInfo.environment["ANDROID_SERIAL"].flatMap { $0.isEmpty ? nil : $0 }  // droidlink IP:PORT로 지정한 기기
 let env = URL(fileURLWithPath: "/usr/bin/env")
 signal(SIGPIPE, SIG_IGN)
+// Finder에서 실행한 앱은 PATH에 Homebrew가 없어서 adb/scrcpy를 못 찾는다
+setenv("PATH", "/opt/homebrew/bin:/usr/local/bin:" + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"), 1)
 
 // MARK: 설정 — 스크롤 속도는 맥에 저장, 커서 속도는 폰의 pointer_speed 설정(-7~7)을 직접 바꾼다.
 var scrollSpeed = UserDefaults.standard.object(forKey: "scrollSpeed") as? Double ?? 4  // 1~10
 var scrollPointsPerStep: Double { 200 / scrollSpeed }  // 안드로이드 휠 한 칸에 해당하는 맥 스크롤 거리(pt)
 
 // MARK: adb
-func adb(_ args: [String]) -> String {  // 짧은 명령을 기다렸다가 결과를 받는다
+func run(_ args: [String]) -> String {  // 짧은 명령을 기다렸다가 결과를 받는다
     let p = Process(), pipe = Pipe()
     p.executableURL = env
-    p.arguments = ["adb"] + args
+    p.arguments = args
     p.standardOutput = pipe
     p.standardError = FileHandle.nullDevice
     guard (try? p.run()) != nil else { return "" }
@@ -27,6 +29,8 @@ func adb(_ args: [String]) -> String {  // 짧은 명령을 기다렸다가 결�
     p.waitUntilExit()
     return String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
 }
+func adb(_ args: [String]) -> String { run(["adb"] + args) }
+let missingTools = ["adb", "scrcpy"].filter { run(["which", $0]).isEmpty }
 
 // 계속 열어 두는 `adb shell`. 스크롤과 제스처를 다른 채널로 보내서 서로 기다리지 않게 한다.
 var shells: [String: (process: Process, input: FileHandle)] = [:]
@@ -163,6 +167,19 @@ func adbConnect(_ address: String) -> Bool {
     return true
 }
 
+// 블루투스 테더링: 맥에 생긴 블루투스 네트워크의 게이트웨이가 폰이다.
+// `networksetup -listallhardwareports`의 "Hardware Port: Bluetooth PAN\nDevice: en5" 블록에서 장치를 찾는다.
+func bluetoothDevices(_ ports: String) -> [String] {
+    ports.components(separatedBy: "\n\n").filter { $0.localizedCaseInsensitiveContains("bluetooth") }.compactMap { block in
+        block.split(separator: "\n").first { $0.hasPrefix("Device: ") }.map { String($0.dropFirst(8)) }
+    }
+}
+assert(bluetoothDevices("Hardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: Bluetooth PAN\nDevice: en5\nEthernet Address: x") == ["en5"])
+func bluetoothPhoneAddress() -> String? {
+    bluetoothDevices(run(["networksetup", "-listallhardwareports"]))
+        .lazy.map { run(["ipconfig", "getoption", $0, "router"]) }.first { !$0.isEmpty }
+}
+
 // wireless: nil이면 자동(USB 우선), 값이 있으면 무선만 — 빈 문자열이면 주소를 찾아서, 아니면 그 주소로
 func pickDevice(wireless: String?) -> String? {
     if wireless == nil {
@@ -177,7 +194,7 @@ func pickDevice(wireless: String?) -> String? {
 }
 
 // MARK: 연결 / 연결 해제
-var connecting = false, pendingWireless: String?
+var connecting = false, pendingWireless: String?, retried = false
 func connect(wireless: String? = nil) {
     guard scrcpyProcess == nil, !connecting else { return }
     connecting = true
@@ -188,7 +205,7 @@ func connect(wireless: String? = nil) {
             connecting = false
             if let picked { launchScrcpy(picked) } else {
                 ui.update(wireless == nil ? "연결 실패 · USB 케이블을 꽂거나, 폰에서 무선 디버깅을 켜고 '무선 연결'을 누르세요"
-                                          : "무선 연결 실패 · 폰의 무선 디버깅이 켜져 있고 같은 Wi-Fi인지 확인하세요 (처음이면 페어링 먼저)")
+                                          : "무선 연결 실패 · Wi-Fi: 무선 디버깅이 켜져 있고 같은 Wi-Fi인지, 처음이면 페어링 먼저 · 블루투스: [무선 준비 (5555)]를 먼저")
             }
         }
     }
@@ -226,6 +243,7 @@ func reconnectWireless(_ address: String) {
 // 이 앱이 띄운 scrcpy는 SIGTERM/SIGINT를 무시해서, 맥 앱 종료 요청으로 끄고 안 되면 강제 종료한다.
 func disconnect() {
     guard let p = scrcpyProcess else { return }
+    retried = true  // 직접 끊은 것이니 다시 시도하지 않는다
     if let app = scrcpy ?? NSRunningApplication(processIdentifier: p.processIdentifier), app.terminate() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if p.isRunning { kill(p.processIdentifier, SIGKILL) } }
     } else {
@@ -238,8 +256,16 @@ func disconnected() {
     let wasConnected = scrcpy != nil
     scrcpyProcess = nil; scrcpy = nil; pid = 0
     shells.values.forEach { $0.process.terminate() }; shells = [:]
+    if let next = pendingWireless { pendingWireless = nil; connect(wireless: next); return }
+    // 직전 연결의 정리가 폰에서 덜 끝나 바로 실패하는 경우가 있어 한 번만 다시 시도한다
+    if !wasConnected && !retried {
+        retried = true
+        ui.update("다시 연결 중…")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { launchScrcpy(serial) }
+        return
+    }
+    retried = false
     ui.update(wasConnected ? "연결 안 됨" : "연결 실패 · 폰에서 USB/무선 디버깅 허용을 확인하세요")
-    if let next = pendingWireless { pendingWireless = nil; connect(wireless: next) }
 }
 
 // MARK: 스크롤 — scrcpy 2.7의 가상 휠은 트랙패드 스크롤을 제대로 못 옮긴다
@@ -361,7 +387,8 @@ final class UI: NSObject, NSApplicationDelegate {
     lazy var disconnectButton = NSButton(title: "연결 해제", target: self, action: #selector(disconnectTapped))
     lazy var pairButton = NSButton(title: "페어링", target: self, action: #selector(pairTapped))
     lazy var wirelessButton = NSButton(title: "무선 연결", target: self, action: #selector(wirelessTapped))
-    lazy var usbToWirelessButton = NSButton(title: "USB로 무선 준비", target: self, action: #selector(usbToWirelessTapped))
+    lazy var openPortButton = NSButton(title: "무선 준비 (5555)", target: self, action: #selector(openPortTapped))
+    lazy var bluetoothButton = NSButton(title: "블루투스 연결", target: self, action: #selector(bluetoothTapped))
     let addressField = NSTextField(string: savedAddress ?? "")
     let codeField = NSTextField(string: "")
     lazy var cursorSlider = slider(-7, 7, 0, #selector(cursorChanged))
@@ -393,7 +420,8 @@ final class UI: NSObject, NSApplicationDelegate {
         for f in [addressField, codeField] { f.widthAnchor.constraint(equalToConstant: 200).isActive = true }
         let wirelessHint = NSTextField(wrappingLabelWithString:
             "무선: 폰 개발자 옵션 → 무선 디버깅 켜기 → '페어링 코드로 기기 페어링'의 코드를 넣고 [페어링] → [무선 연결]. " +
-            "또는 USB로 꽂은 채 [USB로 무선 준비]를 누르면 케이블을 뽑아도 됩니다 (폰을 재부팅하면 다시 필요).")
+            "또는 USB로 꽂은 채 [무선 준비 (5555)]를 누르면 케이블을 뽑아도 됩니다 (폰을 재부팅하면 다시 필요).\n" +
+            "블루투스: [무선 준비 (5555)]를 한 번 한 뒤, 폰에서 블루투스 테더링을 켜고 맥 블루투스 설정에서 폰을 네트워크로 연결 → [블루투스 연결]. Wi-Fi보다 느립니다.")
         wirelessHint.textColor = .secondaryLabelColor
         wirelessHint.font = .systemFont(ofSize: 11)
         wirelessHint.widthAnchor.constraint(equalToConstant: 300).isActive = true
@@ -402,7 +430,8 @@ final class UI: NSObject, NSApplicationDelegate {
             NSStackView(views: [connectButton, disconnectButton]),
             row("무선 주소", addressField),
             row("페어링 코드", codeField),
-            NSStackView(views: [pairButton, wirelessButton, usbToWirelessButton]),
+            NSStackView(views: [pairButton, wirelessButton]),
+            NSStackView(views: [openPortButton, bluetoothButton]),
             wirelessHint,
             row("커서 속도", cursorSlider),
             row("스크롤 속도", scrollSlider),
@@ -417,6 +446,11 @@ final class UI: NSObject, NSApplicationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if !missingTools.isEmpty {
+            update("\(missingTools.joined(separator: ", ")) 없음 · 터미널에서 brew install scrcpy android-platform-tools 를 실행한 뒤 다시 여세요")
+            connectButton.isEnabled = false
+            return
+        }
         update("연결 안 됨")
         connect()
     }
@@ -455,21 +489,37 @@ final class UI: NSObject, NSApplicationDelegate {
         }
     }
 
-    // USB로 꽂혀 있을 때 폰을 Wi-Fi 디버깅(포트 5555)으로 바꾸고 그 주소로 다시 연결한다.
-    @objc func usbToWirelessTapped() {
-        status.stringValue = "USB로 무선 준비 중…"
+    // 연결된 폰(USB 우선)의 adb를 포트 5555로 열어 둔다. 케이블을 뽑아도 Wi-Fi·블루투스로 연결할 수 있다 (재부팅 전까지).
+    // 폰이 Wi-Fi에 있으면 바로 그 주소로 다시 연결한다.
+    @objc func openPortTapped() {
+        status.stringValue = "무선 준비 중…"
         DispatchQueue.global().async {
-            guard let usb = devices().first(where: { !isWireless($0) }) else {
+            let list = devices()
+            guard let device = list.first(where: { !isWireless($0) }) ?? list.first else {
                 DispatchQueue.main.async { self.status.stringValue = "USB 케이블로 폰을 먼저 연결하세요" }; return
             }
-            guard let ip = parseWlanIP(adb(["-s", usb, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"])) else {
-                DispatchQueue.main.async { self.status.stringValue = "폰이 Wi-Fi에 연결돼 있지 않습니다" }; return
-            }
-            _ = adb(["-s", usb, "tcpip", "5555"])
+            let ip = parseWlanIP(adb(["-s", device, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"]))
+            _ = adb(["-s", device, "tcpip", "5555"])
             sleep(2)  // 폰의 adb가 다시 시작될 때까지
             DispatchQueue.main.async {
+                guard let ip else {
+                    self.status.stringValue = "포트 5555 열림 · 케이블을 뽑고 블루투스 테더링을 연결한 뒤 [블루투스 연결]을 누르세요"; return
+                }
                 self.addressField.stringValue = "\(ip):5555"
                 reconnectWireless("\(ip):5555")
+            }
+        }
+    }
+
+    @objc func bluetoothTapped() {
+        status.stringValue = "블루투스 네트워크 찾는 중…"
+        DispatchQueue.global().async {
+            let phone = bluetoothPhoneAddress()
+            DispatchQueue.main.async {
+                guard let phone else {
+                    self.status.stringValue = "블루투스 네트워크가 없습니다 · 폰에서 블루투스 테더링을 켜고, 맥의 블루투스 설정에서 폰을 네트워크로 연결하세요"; return
+                }
+                reconnectWireless("\(phone):5555")
             }
         }
     }
